@@ -1,44 +1,42 @@
-import express from "express";
-import bodyParser from "body-parser";
-import axios from "axios";
-import { v4 as uuidv4 } from "uuid";
-import "dotenv/config";
+// server.js  (CommonJS)
+const express = require("express");
+const bodyParser = require("body-parser");
+const axios = require("axios");
+const { v4: uuidv4 } = require("uuid");
+require("dotenv").config();
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-// Temporary storage for generated audio
+// in-memory audio store
 const audioStore = new Map();
 
+// --- helpers ---
 async function chatReply(userText) {
   const systemPrompt = `
-You are a friendly, efficient phone receptionist for ${process.env.SALON_NAME} in ${process.env.SALON_CITY}.
-Be concise, professional, and warm. Your main tasks:
-1. Help clients book or reschedule hair appointments.
-2. Ask for name, service (cut, colour, etc.), stylist preference, and day/time.
-3. When you have enough info, end your reply with:
-ACTION_JSON: {"action":"book","service":"<service>","stylist":"<stylist>","datetime":"<date>","name":"<name>","phone":"<phone>"}
-Do NOT make up fake bookings.
-If asked for location, say "${process.env.SALON_ADDRESS}".
-If asked to speak to someone, say you'll connect them soon.
-Keep answers short and natural.
-  `;
+You are a friendly phone receptionist for ${process.env.SALON_NAME} in ${process.env.SALON_CITY}.
+Collect service, stylist preference, day/time, name, phone, email.
+If caller asks for address, answer: ${process.env.SALON_ADDRESS}.
+If caller asks for a human, respond with: ACTION_JSON: {"action":"transfer"}.
+When you have all booking fields, respond ending with:
+ACTION_JSON: {"action":"book","service":"<service>","stylist":"<stylist>","datetime":"<date>","name":"<name>","phone":"<phone>","email":"<email>"}
+  `.trim();
 
-  const gpt = await axios.post(
+  const r = await axios.post(
     "https://api.openai.com/v1/chat/completions",
     {
       model: "gpt-4o-mini",
+      temperature: 0.4,
       messages: [
         { role: "system", content: systemPrompt },
-        { role: "user", content: userText || "Client joined the line." }
-      ],
-      temperature: 0.4
+        { role: "user", content: userText || "Caller joined the line." }
+      ]
     },
     { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` } }
   );
 
-  return gpt.data.choices[0].message.content;
+  return r.data.choices[0].message.content;
 }
 
 async function synthesizeVoice(text) {
@@ -53,75 +51,99 @@ async function synthesizeVoice(text) {
     {
       headers: {
         "xi-api-key": process.env.ELEVEN_API_KEY,
-        "Content-Type": "application/json",
-        "Accept": "audio/mpeg"
+        "Accept": "audio/mpeg",
+        "Content-Type": "application/json"
       },
       responseType: "arraybuffer"
     }
   );
-
   return Buffer.from(data);
 }
 
 function extractActionJSON(text) {
-  const match = text.match(/ACTION_JSON:\s*(\{.*\})/s);
-  if (!match) return null;
-  try {
-    return JSON.parse(match[1]);
-  } catch {
-    return null;
-  }
+  const m = text.match(/ACTION_JSON:\s*(\{.*\})/s);
+  if (!m) return null;
+  try { return JSON.parse(m[1]); } catch { return null; }
 }
 
-// Twilio webhook endpoints
-app.post("/voice/incoming", async (req, res) => {
-  const greet = `Hi! Thanks for calling ${process.env.SALON_NAME}. Are you looking to book, reschedule, or ask a quick question?`;
-  const audio = await synthesizeVoice(greet);
-  const id = uuidv4();
-  audioStore.set(id, audio);
+// --- routes ---
 
-  res.type("text/xml").send(`
-    <Response>
-      <Play>https://${req.headers.host}/audio/${id}.mp3</Play>
-      <Gather input="speech" action="/voice/turn" speechTimeout="auto" />
-    </Response>
-  `);
-});
-
-app.post("/voice/turn", async (req, res) => {
-  const userSpeech = req.body.SpeechResult || "";
-  const reply = await chatReply(userSpeech);
-
-  const action = extractActionJSON(reply);
-  if (action?.action === "book" && process.env.BOOKING_WEBHOOK_URL) {
-    try {
-      await axios.post(process.env.BOOKING_WEBHOOK_URL, action);
-    } catch (e) {
-      console.error("Booking webhook failed:", e.message);
-    }
-  }
-
-  const cleanedReply = reply.replace(/ACTION_JSON:[\s\S]*$/, "").trim();
-  const audio = await synthesizeVoice(cleanedReply);
-  const id = uuidv4();
-  audioStore.set(id, audio);
-
-  res.type("text/xml").send(`
-    <Response>
-      <Play>https://${req.headers.host}/audio/${id}.mp3</Play>
-      <Gather input="speech" action="/voice/turn" speechTimeout="auto" />
-    </Response>
-  `);
-});
-
+// serve generated audio
 app.get("/audio/:id.mp3", (req, res) => {
-  const audio = audioStore.get(req.params.id.split(".")[0]);
-  if (!audio) return res.status(404).send("Audio not found");
+  const buf = audioStore.get(req.params.id.replace(".mp3",""));
+  if (!buf) return res.status(404).end();
   res.set("Content-Type", "audio/mpeg");
-  res.send(audio);
+  res.send(buf);
 });
 
-app.get("/", (_, res) => res.send("Hair Hunters Voicebot is running ✅"));
+// first hook Twilio hits
+app.post("/voice/incoming", async (req, res) => {
+  try {
+    const greet = `Hi! Thanks for calling ${process.env.SALON_NAME}. Are you looking to book, reschedule, or ask a quick question?`;
+    const audio = await synthesizeVoice(greet);
+    const id = uuidv4();
+    audioStore.set(id, audio);
 
+    // TwiML (XML) response from Node.js:
+    res.type("text/xml").send(`
+      <Response>
+        <Play>https://${req.headers.host}/audio/${id}.mp3</Play>
+        <Gather input="speech" action="/voice/turn" speechTimeout="auto" />
+      </Response>
+    `);
+  } catch (e) {
+    console.error("incoming error:", e);
+    res.type("text/xml").send(`<Response><Say>Sorry, I’m having trouble.</Say></Response>`);
+  }
+});
+
+// subsequent turns
+app.post("/voice/turn", async (req, res) => {
+  try {
+    const userSpeech = req.body.SpeechResult || "";
+    const reply = await chatReply(userSpeech);
+
+    // transfer to human?
+    const action = extractActionJSON(reply);
+    if (action?.action === "transfer" && process.env.SALON_PHONE) {
+      return res.type("text/xml").send(`
+        <Response>
+          <Say>Okay, I’ll connect you now.</Say>
+          <Dial>${process.env.SALON_PHONE}</Dial>
+        </Response>
+      `);
+    }
+
+    // (optional) send booking payload to your webhook
+    if (action?.action === "book" && process.env.BOOKING_WEBHOOK_URL) {
+      try { await axios.post(process.env.BOOKING_WEBHOOK_URL, action); } catch {}
+    }
+
+    // cap speech length to avoid 64KB TwiML
+    const MAX_TTS_CHARS = 800;
+    const speak = reply.replace(/ACTION_JSON:[\s\S]*$/,"").trim().slice(0, MAX_TTS_CHARS);
+
+    const audio = await synthesizeVoice(speak || "Could you repeat that?");
+    const id = uuidv4();
+    audioStore.set(id, audio);
+
+    res.type("text/xml").send(`
+      <Response>
+        <Play>https://${req.headers.host}/audio/${id}.mp3</Play>
+        <Gather input="speech" action="/voice/turn" speechTimeout="auto" />
+      </Response>
+    `);
+  } catch (e) {
+    console.error("turn error:", e);
+    res.type("text/xml").send(`
+      <Response>
+        <Say>Sorry, I hit a snag. Please say that again.</Say>
+        <Gather input="speech" action="/voice/turn" speechTimeout="auto" />
+      </Response>
+    `);
+  }
+});
+
+app.get("/", (_req, res) => res.send("Hair Hunters Voicebot is running ✅"));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Voice bot running on port ${PORT}`));
