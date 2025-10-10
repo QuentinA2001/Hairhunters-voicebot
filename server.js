@@ -82,7 +82,7 @@ function extractAction(text) {
 // --- Twilio webhooks ---
 app.post("/voice/incoming", async (req, res) => {
   try {
-    const greet = `Hi! Thanks for calling ${process.env.SALON_NAME}. Are you looking to book, reschedule, or ask a quick question?`;
+    const greet = `Hi! Thanks for calling ${process.env.SALON_NAME}. How can I help you today?`;
     const audio = await tts(greet);
     const id = uuidv4();
     audioStore.set(id, audio);
