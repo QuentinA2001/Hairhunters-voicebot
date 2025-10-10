@@ -13,9 +13,10 @@ const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-// --- In‑memory stores ---
+// --- In-memory stores ---
 const audioStore = new Map(); // id -> Buffer
-const callState = new Map(); // CallSid -> { lastSpoken: string }
+// CallSid -> { lastSpoken: string, history: Array<{role:string, content:string}>, slots: { name?, phone?, email?, service?, stylist?, datetime? } }
+const callState = new Map();
 
 // --- helpers ---
 const pick = (v) => (v ? String(v).slice(0, 6) + "…" : "missing");
@@ -61,41 +62,30 @@ async function sayAndGather({ req, res, text, callSid }) {
   const spoken = String(text ?? "").trim() || "Got it.";
   // remember last prompt per call
   if (callSid) {
-    const st = callState.get(callSid) || {};
+    const st = callState.get(callSid) || { history: [], slots: {} };
     st.lastSpoken = spoken;
     callState.set(callSid, st);
   }
+  const gather = `<Gather input="speech"
+        action="/voice/turn"
+        method="POST"
+        speechTimeout="auto"
+        actionOnEmptyResult="true"
+        language="en-CA"
+        enhanced="true"
+        profanityFilter="false"
+        speechModel="phone_call" />`;
   try {
     const audio = await tts(spoken);
     const id = uuidv4();
     audioStore.set(id, audio);
     return res
       .type("text/xml")
-      .send(
-        `<Response>\n  <Play>https://${req.headers.host}/audio/${id}.mp3</Play>\n  <Gather input="speech"
-        action="/voice/turn"
-        method="POST"
-        speechTimeout="auto"
-        actionOnEmptyResult="true"
-        language="en-CA"
-        enhanced="true"
-        profanityFilter="false"
-        speechModel="phone_call" />\n</Response>`
-      );
+      .send(`\n<Response>\n  <Play>https://${req.headers.host}/audio/${id}.mp3</Play>\n  ${gather}\n</Response>`);
   } catch {
     return res
       .type("text/xml")
-      .send(
-        `<Response>\n  <Say>${spoken}</Say>\n  <Gather input="speech"
-        action="/voice/turn"
-        method="POST"
-        speechTimeout="auto"
-        actionOnEmptyResult="true"
-        language="en-CA"
-        enhanced="true"
-        profanityFilter="false"
-        speechModel="phone_call" />\n</Response>`
-      );
+      .send(`\n<Response>\n  <Say>${spoken}</Say>\n  ${gather}\n</Response>`);
   }
 }
 
@@ -105,6 +95,7 @@ You are a concise, warm phone receptionist for ${process.env.SALON_NAME} in ${pr
 General rules:
 - Keep replies SHORT (1–2 sentences). Ask ONE question at a time.
 - Never invent data; ask for missing fields.
+- Do NOT re-ask for fields already provided; briefly confirm what you have and move to the next missing field.
 - If the caller asks for a person/human/manager/desk, transfer them.
 - If address is requested, you may directly speak: "${process.env.SALON_ADDRESS}".
 
@@ -134,32 +125,64 @@ Notes:
 - Keep the flow moving: always end with a clear next question unless you output an ACTION_JSON.
 `;
 
-async function chatReply(userText) {
+// --- simple local fallback when LLM is unavailable (e.g., 429 insufficient_quota) ---
+function localFallbackReply(text) {
+  const s = (text || "").toLowerCase();
+  if (/(manager|human|reception|front desk|real person|someone)/i.test(s)) return 'ACTION_JSON: {"action":"transfer"}';
+  if (/address|where.*located|location/.test(s)) return 'ACTION_JSON: {"action":"info","topic":"address"}';
+  if (/hour|open|close|closing/.test(s)) return 'ACTION_JSON: {"action":"info","topic":"hours"}';
+  if (/price|cost|how much/.test(s)) return 'ACTION_JSON: {"action":"info","topic":"prices"}';
+  if (/website|site|online/.test(s)) return 'ACTION_JSON: {"action":"info","topic":"website"}';
+  if (/park|parking/.test(s)) return 'ACTION_JSON: {"action":"info","topic":"parking"}';
+
+  if (/cancel/.test(s)) return 'Sure—what name is the booking under, and what date/time should I cancel?';
+  if (/resched|move.*appointment|change.*time|another time/.test(s)) return 'No problem—what name is the booking under, and what new date/time works?';
+
+  if (/(book|appointment|schedule|haircut|colour|color)/.test(s)) {
+    if (!/(cut\+?colour|cut\s*\+\s*colour|colour|color|\bcut\b)/.test(s)) return 'Sure—what service would you like: cut, colour, or cut+colour?';
+    if (!/(today|tomorrow|mon|tue|wed|thu|fri|sat|sun|\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}(:\d{2})?\s*(am|pm)?\b)/.test(s)) return 'Great—what day and roughly what time works for you?';
+    if (!/(\+?\d[\d\s\-().]{6,}\d)/.test(s)) return 'Got it—what’s the best phone number for the booking?';
+    if (!/@/.test(s)) return 'And your email, so we can send a confirmation?';
+    return 'ACTION_JSON: {"action":"confirm","summary":"I have your appointment noted. Shall I lock it in?"}';
+  }
+  if (/what|repeat|again|pardon|sorry/.test(s)) return 'ACTION_JSON: {"action":"reprompt"}';
+  return "I can help with bookings, reschedules, hours, and our address—what do you need today?";
+}
+
+async function chatReply(userText, state) {
+  const slotsNote = state?.slots ? `Known fields so far: ${JSON.stringify(state.slots)}` : "";
+  const historyMsgs = Array.isArray(state?.history) ? state.history.slice(-8) : [];
+  const messages = [
+    { role: "system", content: SYSTEM_PROMPT },
+    slotsNote ? { role: "system", content: slotsNote } : null,
+    ...historyMsgs,
+    { role: "user", content: userText || "Caller joined the line." },
+  ].filter(Boolean);
+
+  const headers = { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" };
+
+  const postOnce = () => axios.post(
+    "https://api.openai.com/v1/chat/completions",
+    { model: "gpt-4o-mini", temperature: 0.4, messages },
+    { headers, timeout: 15000 }
+  );
+
   try {
-    const r = await axios.post(
-      "https://api.openai.com/v1/chat/completions",
-      {
-        model: "gpt-4o-mini",
-        temperature: 0.4,
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: userText || "Caller joined the line." },
-        ],
-      },
-      {
-        headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-        timeout: 15000,
+    let r;
+    try { r = await postOnce(); }
+    catch (e) {
+      if (e?.response?.status >= 500 || e?.code === "ECONNRESET" || e?.code === "ETIMEDOUT") {
+        await new Promise((s) => setTimeout(s, 350));
+        r = await postOnce();
+      } else {
+        throw e;
       }
-    );
-    return r.data.choices?.[0]?.message?.content?.trim() || "Sorry, could you repeat that?";
+    }
+    return r.data.choices?.[0]?.message?.content?.trim() || localFallbackReply(userText);
   } catch (e) {
-    console.error("❌ OpenAI chat error:", {
-      status: e?.response?.status,
-      data: e?.response?.data,
-      message: e?.message,
-      key_prefix: (process.env.OPENAI_API_KEY || "").slice(0, 6) + "…",
-    });
-    throw e;
+    console.error("❌ OpenAI chat error:", { status: e?.response?.status, data: e?.response?.data, message: e?.message, key_prefix: (process.env.OPENAI_API_KEY || "").slice(0,6)+"…" });
+    // Use local fallback when quota/network/model fails
+    return localFallbackReply(userText);
   }
 }
 
@@ -167,38 +190,23 @@ async function chatReply(userText) {
 app.post("/voice/incoming", async (req, res) => {
   const greet = `Hi! Thanks for calling ${process.env.SALON_NAME}. How can I help you today?`;
   const callSid = req.body.CallSid || uuidv4();
-  callState.set(callSid, { lastSpoken: greet });
+  callState.set(callSid, { lastSpoken: greet, history: [], slots: {} });
+  const gather = `<Gather input="speech"
+        action="/voice/turn"
+        method="POST"
+        speechTimeout="auto"
+        actionOnEmptyResult="true"
+        language="en-CA"
+        enhanced="true"
+        profanityFilter="false"
+        speechModel="phone_call" />`;
   try {
     const audio = await tts(greet);
     const id = uuidv4();
     audioStore.set(id, audio);
-    res
-      .type("text/xml")
-      .send(
-        `<Response>\n  <Play>https://${req.headers.host}/audio/${id}.mp3</Play>\n  <Gather input="speech"
-        action="/voice/turn"
-        method="POST"
-        speechTimeout="auto"
-        actionOnEmptyResult="true"
-        language="en-CA"
-        enhanced="true"
-        profanityFilter="false"
-        speechModel="phone_call" />\n</Response>`
-      );
+    res.type("text/xml").send(`\n<Response>\n  <Play>https://${req.headers.host}/audio/${id}.mp3</Play>\n  ${gather}\n</Response>`);
   } catch {
-    res
-      .type("text/xml")
-      .send(
-        `<Response>\n  <Say>Welcome to ${process.env.SALON_NAME}. Please tell me what you need.</Say>\n  <Gather input="speech"
-        action="/voice/turn"
-        method="POST"
-        speechTimeout="auto"
-        actionOnEmptyResult="true"
-        language="en-CA"
-        enhanced="true"
-        profanityFilter="false"
-        speechModel="phone_call" />\n</Response>`
-      );
+    res.type("text/xml").send(`\n<Response>\n  <Say>Welcome to ${process.env.SALON_NAME}. Please tell me what you need.</Say>\n  ${gather}\n</Response>`);
   }
 });
 
@@ -206,46 +214,62 @@ app.post("/voice/turn", async (req, res) => {
   const userSpeech = req.body.SpeechResult || "";
   const callSid = req.body.CallSid || undefined;
   console.log("📞 SpeechResult:", JSON.stringify(userSpeech));
+  const state = callState.get(callSid) || { history: [], slots: {} };
+
   if (!userSpeech.trim()) {
-    const st = callState.get(callSid) || {};
-    const repeat = st.lastSpoken || "Sorry, I didn’t catch that. What service would you like: cut, colour, or cut+colour?";
+    const repeat = state.lastSpoken || "Sorry, I didn’t catch that. What service would you like: cut, colour, or cut+colour?";
     return sayAndGather({ req, res, text: repeat, callSid });
   }
 
+  // --- naive slot extraction from caller utterance ---
+  try {
+    const s = userSpeech;
+    const phoneMatch = s.match(/(\+?\d[\d\s\-().]{6,}\d)/);
+    if (phoneMatch) state.slots.phone = phoneMatch[1];
+    const emailMatch = s.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+    if (emailMatch) state.slots.email = emailMatch[0];
+    if (/\b(cut\s*\+\s*colour|cut\+colour)\b/i.test(s)) state.slots.service = "cut+colour";
+    else if (/\bcolour|color\b/i.test(s)) state.slots.service = "colour";
+    else if (/\bcut\b/i.test(s)) state.slots.service = "cut";
+    const nameMatch = s.match(/\b(?:my name is|it'?s|i am|i’m)\s+([A-Z][a-z'-]+(?:\s+[A-Z][a-z'-]+){0,2})/i);
+    if (nameMatch) state.slots.name = nameMatch[1];
+    const dtGuess = s.match(/(today|tomorrow|mon|tue|wed|thu|fri|sat|sun|\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}(:\d{2})?\s*(am|pm)?\b)/i);
+    if (dtGuess && !state.slots.datetime) state.slots.datetime = dtGuess[0];
+  } catch {}
+
+  // remember user turn
+  state.history = (state.history || []).concat([{ role: "user", content: userSpeech }]).slice(-10);
+
   let reply;
   try {
-    reply = await chatReply(userSpeech);
+    reply = await chatReply(userSpeech, state);
   } catch (e) {
     console.error("❌ OpenAI chat error in /voice/turn:", { status: e?.response?.status, data: e?.response?.data, message: e?.message });
     reply = "Sorry, I had trouble understanding that. Could you say it again?";
   }
 
+  // remember assistant turn + persist state
+  state.history = state.history.concat([{ role: "assistant", content: reply }]).slice(-10);
+  callState.set(callSid, state);
+
   const action = extractAction(reply);
 
   // --- ACTION HANDLERS ---
   if (action?.action === "transfer" && process.env.SALON_PHONE) {
-    return res
-      .type("text/xml")
-      .send(
-        `<Response>\n  <Say>Okay, I’ll connect you to the salon now.</Say>\n  <Dial>${process.env.SALON_PHONE}</Dial>\n</Response>`
-      );
+    return res.type("text/xml").send(`<Response>\n  <Say>Okay, I’ll connect you to the salon now.</Say>\n  <Dial>${process.env.SALON_PHONE}</Dial>\n</Response>`);
   }
 
   if (action?.action === "end") {
-    return res
-      .type("text/xml")
-      .send(`<Response><Say>Thanks for calling. Have a great day!</Say><Hangup/></Response>`);
+    return res.type("text/xml").send(`<Response><Say>Thanks for calling. Have a great day!</Say><Hangup/></Response>`);
   }
 
   if (action?.action === "reprompt") {
-    const st = callState.get(callSid) || {};
-    const repeat = st.lastSpoken || "Could you please repeat that?";
+    const repeat = state.lastSpoken || "Could you please repeat that?";
     return sayAndGather({ req, res, text: repeat, callSid });
   }
 
   if (action?.action === "info") {
     let say = "One moment.";
-    const t = (s) => (s ? String(s) : undefined);
     if (action.topic === "hours" && process.env.SALON_HOURS) say = `Our hours are ${process.env.SALON_HOURS}.`;
     if (action.topic === "address" && process.env.SALON_ADDRESS) say = `We're at ${process.env.SALON_ADDRESS}.`;
     if (action.topic === "prices" && process.env.SALON_PRICES) say = `Prices: ${process.env.SALON_PRICES}.`;
@@ -260,21 +284,12 @@ app.post("/voice/turn", async (req, res) => {
       const body = new URLSearchParams();
       body.set("To", action.to);
       body.set("Body", action.text);
-      if (process.env.TWILIO_MESSAGING_SID) {
-        body.set("MessagingServiceSid", process.env.TWILIO_MESSAGING_SID);
-      } else {
-        body.set("From", process.env.SALON_TWILIO_NUMBER);
-      }
+      if (process.env.TWILIO_MESSAGING_SID) body.set("MessagingServiceSid", process.env.TWILIO_MESSAGING_SID);
+      else body.set("From", process.env.SALON_TWILIO_NUMBER);
       await axios.post(
         `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Messages.json`,
         body,
-        {
-          headers: {
-            Authorization: `Basic ${twilioBasicAuth()}`,
-            "Content-Type": "application/x-www-form-urlencoded",
-          },
-          timeout: 10000,
-        }
+        { headers: { Authorization: `Basic ${twilioBasicAuth()}`, "Content-Type": "application/x-www-form-urlencoded" }, timeout: 10000 }
       );
       return sayAndGather({ req, res, text: "I just sent that text.", callSid });
     } catch (e) {
@@ -284,12 +299,7 @@ app.post("/voice/turn", async (req, res) => {
   }
 
   if (action?.action === "voicemail") {
-    const reason = action.reason ? String(action.reason) : "";
-    return res
-      .type("text/xml")
-      .send(
-        `<Response>\n  <Say>I'm sorry we can't take the call right now. Please leave a message after the tone.</Say>\n  <Record maxLength="90" playBeep="true" action="/voice/voicemail-done" method="POST"/>\n</Response>`
-      );
+    return res.type("text/xml").send(`\n<Response>\n  <Say>I'm sorry we can't take the call right now. Please leave a message after the tone.</Say>\n  <Record maxLength="90" playBeep="true" action="/voice/voicemail-done" method="POST"/>\n</Response>`);
   }
 
   if (action?.action === "confirm") {
@@ -326,9 +336,7 @@ app.post("/voice/voicemail-done", async (req, res) => {
       recordingUrl: req.body.RecordingUrl,
       transcriptionText: req.body.TranscriptionText || undefined,
     };
-    if (process.env.BOOKING_WEBHOOK_URL) {
-      axios.post(process.env.BOOKING_WEBHOOK_URL, payload).catch(() => {});
-    }
+    if (process.env.BOOKING_WEBHOOK_URL) axios.post(process.env.BOOKING_WEBHOOK_URL, payload).catch(() => {});
   } catch (e) {
     console.error("Voicemail post failed", e?.response?.data || e);
   }
@@ -379,7 +387,9 @@ app.get("/", (_, res) => res.send("Hair Hunters Voicebot is running ✅"));
 app.get("/debug/turn", async (req, res) => {
   const text = req.query.text || "can i book an appointment";
   try {
-    const reply = await chatReply(String(text));
+    const callSid = "DEBUG";
+    const state = callState.get(callSid) || { history: [], slots: {} };
+    const reply = await chatReply(String(text), state);
     res.json({ heard: text, reply, action: extractAction(reply) });
   } catch (e) {
     res.status(500).json({ error: "openai_failed", details: e?.response?.data || e?.message });
