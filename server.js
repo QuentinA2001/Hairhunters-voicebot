@@ -10,6 +10,7 @@ app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
 const audioStore = new Map();
+const pick = (v) => (v ? String(v).slice(0, 6) + "…" : "missing");
 
 const SYSTEM_PROMPT = `
 You are a concise, warm phone receptionist for ${process.env.SALON_NAME} in ${process.env.SALON_CITY}.
@@ -40,22 +41,36 @@ async function chatReply(userText) {
   return r.data.choices?.[0]?.message?.content?.trim() || "Sorry, could you repeat that?";
 }
 
+// --- improved ElevenLabs TTS with logging ---
 async function tts(text) {
   const safe = String(text).slice(0, 800);
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVEN_VOICE_ID}/stream`;
-  const { data } = await axios.post(
-    url,
-    { text: safe, model_id: "eleven_multilingual_v2", voice_settings: { stability: 0.4, similarity_boost: 0.8 } },
-    {
-      headers: {
-        "xi-api-key": process.env.ELEVEN_API_KEY,
-        "Content-Type": "application/json",
-        "Accept": "audio/mpeg"
-      },
-      responseType: "arraybuffer"
-    }
-  );
-  return Buffer.from(data);
+  try {
+    const resp = await axios.post(
+      url,
+      { text: safe, model_id: "eleven_multilingual_v2", voice_settings: { stability: 0.4, similarity_boost: 0.8 } },
+      {
+        headers: {
+          "xi-api-key": process.env.ELEVEN_API_KEY,
+          "Content-Type": "application/json",
+          "Accept": "audio/mpeg"
+        },
+        responseType: "arraybuffer",
+        timeout: 12000
+      }
+    );
+    const buf = Buffer.from(resp.data);
+    console.log(`✅ ElevenLabs OK | bytes=${buf.length}`);
+    return buf;
+  } catch (e) {
+    console.log("❌ ElevenLabs TTS error", {
+      status: e?.response?.status,
+      data: e?.response?.data?.toString?.().slice(0, 200),
+      voice: process.env.ELEVEN_VOICE_ID,
+      key: pick(process.env.ELEVEN_API_KEY)
+    });
+    throw e;
+  }
 }
 
 function extractAction(text) {
@@ -65,7 +80,6 @@ function extractAction(text) {
 }
 
 // --- Twilio webhooks ---
-
 app.post("/voice/incoming", async (req, res) => {
   try {
     const greet = `Hi! Thanks for calling ${process.env.SALON_NAME}. Are you looking to book, reschedule, or ask a quick question?`;
@@ -136,6 +150,26 @@ app.get("/audio/:id.mp3", (req, res) => {
   if (!buf) return res.status(404).end();
   res.set("Content-Type", "audio/mpeg");
   res.send(buf);
+});
+
+// --- diagnostic routes ---
+app.get("/env-check", (_, res) => {
+  res.json({
+    ELEVEN_API_KEY_len: process.env.ELEVEN_API_KEY?.length || 0,
+    ELEVEN_VOICE_ID: process.env.ELEVEN_VOICE_ID || "missing",
+    OPENAI_API_KEY_len: process.env.OPENAI_API_KEY?.length || 0,
+  });
+});
+
+app.get("/tts-test", async (req, res) => {
+  try {
+    const audio = await tts("Hi, this is the Render server speaking. ElevenLabs is working.");
+    res.set("Content-Type", "audio/mpeg");
+    res.send(audio);
+  } catch (err) {
+    console.error("TTS test failed:", err?.response?.data || err);
+    res.status(500).send("TTS failed");
+  }
 });
 
 app.get("/", (_, res) => res.send("Hair Hunters Voicebot is running ✅"));
