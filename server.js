@@ -72,13 +72,29 @@ async function sayAndGather({ req, res, text, callSid }) {
     return res
       .type("text/xml")
       .send(
-        `<Response>\n  <Play>https://${req.headers.host}/audio/${id}.mp3</Play>\n  <Gather input="speech" action="/voice/turn" method="POST" speechTimeout="auto" />\n</Response>`
+        `<Response>\n  <Play>https://${req.headers.host}/audio/${id}.mp3</Play>\n  <Gather input="speech"
+        action="/voice/turn"
+        method="POST"
+        speechTimeout="auto"
+        actionOnEmptyResult="true"
+        language="en-CA"
+        enhanced="true"
+        profanityFilter="false"
+        speechModel="phone_call" />\n</Response>`
       );
   } catch {
     return res
       .type("text/xml")
       .send(
-        `<Response>\n  <Say>${spoken}</Say>\n  <Gather input="speech" action="/voice/turn" method="POST" speechTimeout="auto" />\n</Response>`
+        `<Response>\n  <Say>${spoken}</Say>\n  <Gather input="speech"
+        action="/voice/turn"
+        method="POST"
+        speechTimeout="auto"
+        actionOnEmptyResult="true"
+        language="en-CA"
+        enhanced="true"
+        profanityFilter="false"
+        speechModel="phone_call" />\n</Response>`
       );
   }
 }
@@ -119,19 +135,32 @@ Notes:
 `;
 
 async function chatReply(userText) {
-  const r = await axios.post(
-    "https://api.openai.com/v1/chat/completions",
-    {
-      model: "gpt-4o-mini",
-      temperature: 0.4,
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: userText || "Caller joined the line." },
-      ],
-    },
-    { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` } }
-  );
-  return r.data.choices?.[0]?.message?.content?.trim() || "Sorry, could you repeat that?";
+  try {
+    const r = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        model: "gpt-4o-mini",
+        temperature: 0.4,
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: userText || "Caller joined the line." },
+        ],
+      },
+      {
+        headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+        timeout: 15000,
+      }
+    );
+    return r.data.choices?.[0]?.message?.content?.trim() || "Sorry, could you repeat that?";
+  } catch (e) {
+    console.error("❌ OpenAI chat error:", {
+      status: e?.response?.status,
+      data: e?.response?.data,
+      message: e?.message,
+      key_prefix: (process.env.OPENAI_API_KEY || "").slice(0, 6) + "…",
+    });
+    throw e;
+  }
 }
 
 // --- Twilio Voice webhooks ---
@@ -146,13 +175,29 @@ app.post("/voice/incoming", async (req, res) => {
     res
       .type("text/xml")
       .send(
-        `<Response>\n  <Play>https://${req.headers.host}/audio/${id}.mp3</Play>\n  <Gather input="speech" action="/voice/turn" method="POST" speechTimeout="auto" />\n</Response>`
+        `<Response>\n  <Play>https://${req.headers.host}/audio/${id}.mp3</Play>\n  <Gather input="speech"
+        action="/voice/turn"
+        method="POST"
+        speechTimeout="auto"
+        actionOnEmptyResult="true"
+        language="en-CA"
+        enhanced="true"
+        profanityFilter="false"
+        speechModel="phone_call" />\n</Response>`
       );
   } catch {
     res
       .type("text/xml")
       .send(
-        `<Response>\n  <Say>Welcome to ${process.env.SALON_NAME}. Please tell me what you need.</Say>\n  <Gather input="speech" action="/voice/turn" method="POST" speechTimeout="auto" />\n</Response>`
+        `<Response>\n  <Say>Welcome to ${process.env.SALON_NAME}. Please tell me what you need.</Say>\n  <Gather input="speech"
+        action="/voice/turn"
+        method="POST"
+        speechTimeout="auto"
+        actionOnEmptyResult="true"
+        language="en-CA"
+        enhanced="true"
+        profanityFilter="false"
+        speechModel="phone_call" />\n</Response>`
       );
   }
 });
@@ -160,11 +205,18 @@ app.post("/voice/incoming", async (req, res) => {
 app.post("/voice/turn", async (req, res) => {
   const userSpeech = req.body.SpeechResult || "";
   const callSid = req.body.CallSid || undefined;
+  console.log("📞 SpeechResult:", JSON.stringify(userSpeech));
+  if (!userSpeech.trim()) {
+    const st = callState.get(callSid) || {};
+    const repeat = st.lastSpoken || "Sorry, I didn’t catch that. What service would you like: cut, colour, or cut+colour?";
+    return sayAndGather({ req, res, text: repeat, callSid });
+  }
 
   let reply;
   try {
     reply = await chatReply(userSpeech);
-  } catch {
+  } catch (e) {
+    console.error("❌ OpenAI chat error in /voice/turn:", { status: e?.response?.status, data: e?.response?.data, message: e?.message });
     reply = "Sorry, I had trouble understanding that. Could you say it again?";
   }
 
@@ -323,6 +375,16 @@ app.get("/tts-test", async (req, res) => {
 
 app.get("/", (_, res) => res.send("Hair Hunters Voicebot is running ✅"));
 
+// --- debug: hit from browser to simulate one turn ---
+app.get("/debug/turn", async (req, res) => {
+  const text = req.query.text || "can i book an appointment";
+  try {
+    const reply = await chatReply(String(text));
+    res.json({ heard: text, reply, action: extractAction(reply) });
+  } catch (e) {
+    res.status(500).json({ error: "openai_failed", details: e?.response?.data || e?.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Voice bot running on port ${PORT}`));
-
