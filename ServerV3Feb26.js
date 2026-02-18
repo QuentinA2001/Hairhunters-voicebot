@@ -162,12 +162,12 @@ app.post("/voice/incoming", async (req, res) => {
 
   const host = process.env.BASE_URL || `https://${req.headers.host}`;
 
-  return res.type("text/xml").send(
-`<Response>
+  return res.type("text/xml").send(`
+<Response>
   <Play>${host}/audio/${id}.mp3</Play>
   <Gather input="speech" action="/voice/turn" method="POST" speechTimeout="auto" />
-</Response>`
-  );
+</Response>
+  `);
 });
 
 app.post("/voice/turn", async (req, res) => {
