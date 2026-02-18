@@ -120,10 +120,27 @@ function getHost(req) {
  * Add a GET handler so your browser test doesn't say "Cannot GET".
  * This is just for debugging/visibility.
  */
-app.get("/voice/incoming", (req, res) => {
-  res.type("text/xml").send(
-    `<Response><Say>Voicebot endpoint is live.</Say></Response>`
-  );
+app.get("/voice/incoming", async (req, res) => {
+  const greet = `Hi! Thanks for calling ${process.env.SALON_NAME || "the salon"}. How can I help you today?`;
+  try {
+    const audio = await tts(greet);
+    const id = uuidv4();
+    audioStore.set(id, audio);
+
+    const host = process.env.BASE_URL || `https://${req.headers.host}`;
+
+    return res.type("text/xml").send(
+`<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+</Response>`
+    );
+  } catch {
+    return res.type("text/xml").send(
+`<Response>
+  <Say>${greet}</Say>
+</Response>`
+    );
+  }
 });
 
 /**
@@ -132,14 +149,19 @@ app.get("/voice/incoming", (req, res) => {
  * Use <Say> for the greeting, then Gather speech.
  */
 app.post("/voice/incoming", async (req, res) => {
-  const salonName = process.env.SALON_NAME || "the salon";
-  const greet = `Hi! Thanks for calling ${salonName}. How can I help you today?`;
+  const greet = `Hi! Thanks for calling ${process.env.SALON_NAME || "the salon"}. How can I help you today?`;
+
+  const audio = await tts(greet);
+  const id = uuidv4();
+  audioStore.set(id, audio);
+
+  const host = process.env.BASE_URL || `https://${req.headers.host}`;
 
   return res.type("text/xml").send(
-    `<Response>
-      <Say>${greet}</Say>
-      <Gather input="speech" action="/voice/turn" method="POST" speechTimeout="auto" />
-    </Response>`
+`<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="/voice/turn" method="POST" speechTimeout="auto" />
+</Response>`
   );
 });
 
