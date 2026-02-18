@@ -20,6 +20,8 @@ const BASE_URL = process.env.BASE_URL || "";
 // In-memory audio store (fine for testing; for production you’d use S3/Redis)
 const audioStore = new Map();
 
+const conversationStore = new Map();
+
 const pick = (v) => (v ? String(v).slice(0, 6) + "…" : "missing");
 
 const SYSTEM_PROMPT = `
@@ -169,14 +171,59 @@ app.post("/voice/incoming", async (req, res) => {
 });
 
 app.post("/voice/turn", async (req, res) => {
+  const callSid = req.body.CallSid;
   const userSpeech = req.body.SpeechResult || "";
-  let reply;
 
-  try {
-    reply = await chatReply(userSpeech);
-  } catch {
-    reply = "Sorry, I had trouble understanding that. Could you say it again?";
+  if (!conversationStore.has(callSid)) {
+    conversationStore.set(callSid, [
+      { role: "system", content: SYSTEM_PROMPT }
+    ]);
   }
+
+  const messages = conversationStore.get(callSid);
+
+  messages.push({ role: "user", content: userSpeech });
+
+  let reply;
+  try {
+    const r = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        model: "gpt-4o-mini",
+        temperature: 0.4,
+        messages
+      },
+      { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` } }
+    );
+
+    reply = r.data.choices?.[0]?.message?.content?.trim();
+    messages.push({ role: "assistant", content: reply });
+
+  } catch {
+    reply = "Sorry, could you repeat that?";
+  }
+
+  const action = extractAction(reply);
+
+  if (action?.action === "book" && process.env.BOOKING_WEBHOOK_URL) {
+    axios.post(process.env.BOOKING_WEBHOOK_URL, action).catch(() => {});
+  }
+
+  const spoken = (action ? "" : reply.replace(/ACTION_JSON:[\s\S]*$/, "").trim()) || "Got it.";
+
+  const audio = await tts(spoken);
+  const id = uuidv4();
+  audioStore.set(id, audio);
+
+  const host = process.env.BASE_URL || `https://${req.headers.host}`;
+
+  return res.type("text/xml").send(
+`<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="/voice/turn" method="POST" speechTimeout="auto" />
+</Response>`
+  );
+});
 
   const action = extractAction(reply);
 
