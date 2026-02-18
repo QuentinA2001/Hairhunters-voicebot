@@ -200,6 +200,9 @@ app.post("/voice/turn", async (req, res) => {
 
   const action = extractAction(reply);
 
+  console.log("AI RAW REPLY:", reply);
+  console.log("PARSED ACTION:", action);
+
   // Transfer to human
   if (action?.action === "transfer" && process.env.SALON_PHONE) {
     conversationStore.delete(callSid);
