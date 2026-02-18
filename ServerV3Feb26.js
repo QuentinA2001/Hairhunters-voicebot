@@ -239,8 +239,15 @@ app.post("/voice/turn", async (req, res) => {
 
   // Fire-and-forget booking webhook
   if (action?.action === "book" && process.env.BOOKING_WEBHOOK_URL) {
-    axios.post(process.env.BOOKING_WEBHOOK_URL, action).catch(() => {});
-  }
+  axios.post(process.env.BOOKING_WEBHOOK_URL, action).catch(() => {});
+  
+  return res.type("text/xml").send(`
+<Response>
+  <Say>Your appointment has been booked. We look forward to seeing you.</Say>
+  <Hangup/>
+</Response>
+  `);
+}
 
   // If the model returned ACTION_JSON, don't speak it
   const spoken =
