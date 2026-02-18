@@ -20,6 +20,7 @@ const BASE_URL = process.env.BASE_URL || "";
 // In-memory audio store (fine for testing; for production you’d use S3/Redis)
 const audioStore = new Map();
 
+// Per-call conversation memory
 const conversationStore = new Map();
 
 const pick = (v) => (v ? String(v).slice(0, 6) + "…" : "missing");
@@ -30,32 +31,19 @@ You are a concise, warm phone receptionist for ${process.env.SALON_NAME || "the 
 Tasks:
 - Handle bookings/reschedules. Collect: name, phone, email, service (cut/colour/cut+colour), stylist (optional), and day/time window.
 - Assume timezone America/Toronto unless otherwise specified.
-- When converting date/time, convert natural language like "Friday at 3pm" into ISO 8601 format.
-- datetime MUST be in ISO format like: 2026-02-21T15:00:00-05:00
+- Convert natural language like "Friday at 3pm" into ISO 8601.
+- datetime MUST be ISO format like: 2026-02-21T15:00:00-05:00
 
 - Keep replies SHORT (1–2 sentences). Ask ONE question at a time.
+
+- If caller asks for a human/manager/desk, respond with:
+ACTION_JSON: {"action":"transfer"}
+(When outputting ACTION_JSON, output ONLY that line.)
 
 - When you have all booking fields, respond with:
 ACTION_JSON: {"action":"book","service":"...","stylist":"...","datetime":"ISO_FORMAT","name":"...","phone":"...","email":"..."}
 (When outputting ACTION_JSON, output ONLY that line.)
 `;
-
-async function chatReply(userText) {
-  const r = await axios.post(
-    "https://api.openai.com/v1/chat/completions",
-    {
-      model: "gpt-4o-mini",
-      temperature: 0.4,
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: userText || "Caller joined the line." },
-      ],
-    },
-    { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }, timeout: 12000 }
-  );
-
-  return r.data.choices?.[0]?.message?.content?.trim() || "Sorry, could you repeat that?";
-}
 
 // --- ElevenLabs TTS with logging ---
 async function tts(text) {
@@ -64,7 +52,6 @@ async function tts(text) {
   const apiKey = process.env.ELEVEN_API_KEY;
 
   if (!voiceId || !apiKey) {
-    // Fail loudly but predictably
     const err = new Error("Missing ELEVEN_VOICE_ID or ELEVEN_API_KEY");
     err.code = "ELEVEN_MISSING_ENV";
     throw err;
@@ -116,14 +103,11 @@ function extractAction(text) {
 }
 
 function getHost(req) {
-  // Prefer BASE_URL if set; otherwise fall back to request host
   return BASE_URL || `https://${req.headers.host}`;
 }
 
 /**
- * ✅ STEP 1 FIX:
- * Add a GET handler so your browser test doesn't say "Cannot GET".
- * This is just for debugging/visibility.
+ * Browser-friendly test endpoint (not used by Twilio)
  */
 app.get("/voice/incoming", async (req, res) => {
   const greet = `Hi! Thanks for calling ${process.env.SALON_NAME || "the salon"}. How can I help you today?`;
@@ -132,7 +116,7 @@ app.get("/voice/incoming", async (req, res) => {
     const id = uuidv4();
     audioStore.set(id, audio);
 
-    const host = process.env.BASE_URL || `https://${req.headers.host}`;
+    const host = getHost(req);
 
     return res.type("text/xml").send(
 `<Response>
@@ -149,134 +133,129 @@ app.get("/voice/incoming", async (req, res) => {
 });
 
 /**
- * ✅ STEP 2 FIX:
- * Twilio needs TwiML immediately. Do NOT call ElevenLabs here.
- * Use <Say> for the greeting, then Gather speech.
+ * Twilio webhook for incoming calls
  */
 app.post("/voice/incoming", async (req, res) => {
   const greet = `Hi! Thanks for calling ${process.env.SALON_NAME || "the salon"}. How can I help you today?`;
 
-  const audio = await tts(greet);
-  const id = uuidv4();
-  audioStore.set(id, audio);
-
-  const host = process.env.BASE_URL || `https://${req.headers.host}`;
-
-  return res.type("text/xml").send(`
-<Response>
-  <Play>${host}/audio/${id}.mp3</Play>
-  <Gather input="speech" action="/voice/turn" method="POST" speechTimeout="auto" />
-</Response>
-  `);
-});
-
-app.post("/voice/turn", async (req, res) => {
-  const callSid = req.body.CallSid;
-  const userSpeech = req.body.SpeechResult || "";
-
-  if (!conversationStore.has(callSid)) {
-    conversationStore.set(callSid, [
-      { role: "system", content: SYSTEM_PROMPT }
-    ]);
-  }
-
-  const messages = conversationStore.get(callSid);
-
-  messages.push({ role: "user", content: userSpeech });
-
-  let reply;
   try {
-    const r = await axios.post(
-      "https://api.openai.com/v1/chat/completions",
-      {
-        model: "gpt-4o-mini",
-        temperature: 0.4,
-        messages
-      },
-      { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` } }
-    );
-
-    reply = r.data.choices?.[0]?.message?.content?.trim();
-    messages.push({ role: "assistant", content: reply });
-
-  } catch {
-    reply = "Sorry, could you repeat that?";
-  }
-
-  const action = extractAction(reply);
-
-  if (action?.action === "book" && process.env.BOOKING_WEBHOOK_URL) {
-    axios.post(process.env.BOOKING_WEBHOOK_URL, action).catch(() => {});
-  }
-
-  const spoken = (action ? "" : reply.replace(/ACTION_JSON:[\s\S]*$/, "").trim()) || "Got it.";
-
-  const audio = await tts(spoken);
-  const id = uuidv4();
-  audioStore.set(id, audio);
-
-  const host = process.env.BASE_URL || `https://${req.headers.host}`;
-
-  return res.type("text/xml").send(
-`<Response>
-  <Play>${host}/audio/${id}.mp3</Play>
-  <Gather input="speech" action="/voice/turn" method="POST" speechTimeout="auto" />
-</Response>`
-  );
-});
-
-  const action = extractAction(reply);
-
-  // Transfer to human
-  if (action?.action === "transfer" && process.env.SALON_PHONE) {
-    return res.type("text/xml").send(
-      `<Response>
-        <Say>Okay, I’ll connect you to the salon now.</Say>
-        <Dial>${process.env.SALON_PHONE}</Dial>
-      </Response>`
-    );
-  }
-
-  // Fire-and-forget booking webhook
-  if (action?.action === "book" && process.env.BOOKING_WEBHOOK_URL) {
-  axios.post(process.env.BOOKING_WEBHOOK_URL, action).catch(() => {});
-  
-  return res.type("text/xml").send(`
-<Response>
-  <Say>Your appointment has been booked. We look forward to seeing you.</Say>
-  <Hangup/>
-</Response>
-  `);
-}
-
-  // If the model returned ACTION_JSON, don't speak it
-  const spoken =
-    (action ? "" : reply.replace(/ACTION_JSON:[\s\S]*$/, "").trim()) || "Got it.";
-
-  // Try ElevenLabs TTS first, fall back to <Say> if it fails
-  try {
-    const audio = await tts(spoken);
+    const audio = await tts(greet);
     const id = uuidv4();
     audioStore.set(id, audio);
 
     const host = getHost(req);
 
     return res.type("text/xml").send(
-      `<Response>
-        <Play>${host}/audio/${id}.mp3</Play>
-        <Gather input="speech" action="/voice/turn" method="POST" speechTimeout="auto" />
-      </Response>`
+`<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="/voice/turn" method="POST" speechTimeout="auto" />
+</Response>`
     );
   } catch {
+    // Fallback if ElevenLabs fails
     return res.type("text/xml").send(
-      `<Response>
-        <Say>${spoken}</Say>
-        <Gather input="speech" action="/voice/turn" method="POST" speechTimeout="auto" />
-      </Response>`
+`<Response>
+  <Say>${greet}</Say>
+  <Gather input="speech" action="/voice/turn" method="POST" speechTimeout="auto" />
+</Response>`
     );
   }
 });
 
+/**
+ * Twilio webhook for each conversation turn
+ */
+app.post("/voice/turn", async (req, res) => {
+  const callSid = req.body.CallSid || "no-callsid";
+  const userSpeech = req.body.SpeechResult || "";
+
+  // Init memory for this call
+  if (!conversationStore.has(callSid)) {
+    conversationStore.set(callSid, [{ role: "system", content: SYSTEM_PROMPT }]);
+  }
+  const messages = conversationStore.get(callSid);
+  messages.push({ role: "user", content: userSpeech });
+
+  // Ask OpenAI
+  let reply = "Sorry, could you repeat that?";
+  try {
+    const r = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        model: "gpt-4o-mini",
+        temperature: 0.4,
+        messages,
+      },
+      {
+        headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+        timeout: 12000,
+      }
+    );
+
+    reply = r.data.choices?.[0]?.message?.content?.trim() || reply;
+    messages.push({ role: "assistant", content: reply });
+  } catch (e) {
+    console.log("❌ OpenAI error", e?.response?.status, e?.response?.data || e?.message);
+  }
+
+  const action = extractAction(reply);
+
+  // Transfer to human
+  if (action?.action === "transfer" && process.env.SALON_PHONE) {
+    conversationStore.delete(callSid);
+    return res.type("text/xml").send(
+`<Response>
+  <Say>Okay, I’ll connect you to the salon now.</Say>
+  <Dial>${process.env.SALON_PHONE}</Dial>
+</Response>`
+    );
+  }
+
+  // Book: send to webhook and end call
+  if (action?.action === "book" && process.env.BOOKING_WEBHOOK_URL) {
+    axios.post(process.env.BOOKING_WEBHOOK_URL, action).catch(() => {});
+    conversationStore.delete(callSid);
+
+    return res.type("text/xml").send(
+`<Response>
+  <Say>Your appointment request has been submitted. We look forward to seeing you.</Say>
+  <Hangup/>
+</Response>`
+    );
+  }
+
+  // Normal speech output (strip ACTION_JSON if present)
+  const spoken =
+    (action ? "" : reply.replace(/ACTION_JSON:[\s\S]*$/, "").trim()) || "Got it.";
+
+  const host = getHost(req);
+
+  // Try ElevenLabs audio; fall back to <Say>
+  try {
+    const audio = await tts(spoken);
+    const id = uuidv4();
+    audioStore.set(id, audio);
+
+    return res.type("text/xml").send(
+`<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="/voice/turn" method="POST" speechTimeout="auto" />
+</Response>`
+    );
+  } catch (e) {
+    console.log("❌ TTS error", e?.response?.status, e?.response?.data || e?.message);
+    return res.type("text/xml").send(
+`<Response>
+  <Say>${spoken}</Say>
+  <Gather input="speech" action="/voice/turn" method="POST" speechTimeout="auto" />
+</Response>`
+    );
+  }
+});
+
+/**
+ * Audio playback endpoint Twilio hits after <Play>
+ */
 app.get("/audio/:id.mp3", (req, res) => {
   const id = (req.params.id || "").replace(".mp3", "");
   const buf = audioStore.get(id);
