@@ -58,6 +58,17 @@ async function tts(text) {
     err.code = "ELEVEN_MISSING_ENV";
     throw err;
   }
+async function ttsWithRetry(text, tries = 2) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    try { 
+      return await ttsWithRetry(text); 
+    } catch (e) { 
+      lastErr = e; 
+    }
+  }
+  throw lastErr;
+}
 
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`;
 
@@ -139,7 +150,7 @@ function formatTorontoConfirm(iso) {
 app.get("/voice/incoming", async (req, res) => {
   const greet = `Hi! Thanks for calling ${process.env.SALON_NAME || "the salon"}. How can I help you today?`;
   try {
-    const audio = await tts(greet);
+    const audio = await ttsWithRetry(greet);
     const id = uuidv4();
     audioStore.set(id, audio);
 
@@ -166,7 +177,7 @@ app.post("/voice/incoming", async (req, res) => {
   const greet = `Hi! Thanks for calling ${process.env.SALON_NAME || "the salon"}. How can I help you today?`;
 
   try {
-    const audio = await tts(greet);
+    const audio = await ttsWithRetry(greet);
     const id = uuidv4();
     audioStore.set(id, audio);
 
@@ -223,12 +234,13 @@ If no year is specified, assume the next upcoming future date.
       "https://api.openai.com/v1/chat/completions",
       {
         model: "gpt-4o-mini",
-        temperature: 0.4,
+        temperature: 0.2,
+        max_tokens: 80,
         messages,
       },
       {
         headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-        timeout: 12000,
+        timeout: 8000,
       }
     );
 
@@ -275,7 +287,7 @@ If no year is specified, assume the next upcoming future date.
 
   // Try ElevenLabs audio; fall back to <Say>
   try {
-    const audio = await tts(spoken);
+    const audio = await ttsWithRetry(spoken);
     const id = uuidv4();
     audioStore.set(id, audio);
 
@@ -322,7 +334,7 @@ app.get("/env-check", (_, res) => {
 
 app.get("/tts-test", async (req, res) => {
   try {
-    const audio = await tts("Hi, this is the Render server speaking. ElevenLabs is working.");
+    const audio = await ttsWithRetry("Hi, this is the Render server speaking. ElevenLabs is working.");
     res.set("Content-Type", "audio/mpeg");
     res.send(audio);
   } catch (err) {
