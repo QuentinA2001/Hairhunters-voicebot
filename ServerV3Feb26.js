@@ -1,6 +1,7 @@
 import express from "express";
 import bodyParser from "body-parser";
 import axios from "axios";
+import https from "https";
 import { v4 as uuidv4 } from "uuid";
 import "dotenv/config";
 
@@ -11,20 +12,24 @@ app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
 /**
- * Optional but recommended on Render:
- * Set BASE_URL in Render env vars to:
+ * Set BASE_URL in Render env vars to your public URL, e.g.
  * https://hairhunters-voicebot.onrender.com
  */
 const BASE_URL = process.env.BASE_URL || "";
 
-// In-memory audio store (fine for testing; for production you’d use S3/Redis)
-const audioStore = new Map();
+// In-memory stores (OK for MVP; use Redis/S3 for production)
+const audioStore = new Map();            // id -> Buffer(mp3)
+const conversationStore = new Map();     // callSid -> messages[]
+const pendingTurns = new Map();          // token -> { ready:boolean, twiml:string, createdAt:number }
 
-// Per-call conversation memory
-const conversationStore = new Map();
+// Keep-alive HTTP client (reduces latency)
+const httpsAgent = new https.Agent({ keepAlive: true });
+const http = axios.create({ httpsAgent, timeout: 12000 });
 
+// Small helper for log redaction
 const pick = (v) => (v ? String(v).slice(0, 6) + "…" : "missing");
 
+// ---------- PROMPT ----------
 const SYSTEM_PROMPT = `
 You are a concise, warm, bubbly phone receptionist for ${process.env.SALON_NAME || "the salon"} in ${process.env.SALON_CITY || "the city"}.
 
@@ -32,11 +37,9 @@ Tasks:
 - Handle bookings/reschedules. Collect: name, phone (Confirm the phone number after they say it), service (haircut/colour/cut & colour), stylist (Cosmo, Vince, Cassidy), and day/time window.
 - Do NOT ask for email.
 - Assume timezone America/Toronto unless otherwise specified.
-- Convert natural language like "Friday at 3pm" into ISO 8601.
+- Convert natural language like "Friday at 3pm" into ISO 8601 with timezone offset.
 - datetime MUST be ISO format like: 2026-02-21T15:00:00-05:00
-- When confirming appointments, always convert ISO date strings into natural spoken format like "Friday, February 20 at 3:00 PM".
-Never read raw ISO timestamps.
-
+- Do NOT state the weekday (Monday/Tuesday/etc) unless the caller already said it. (The server will confirm day-of-week.)
 - Keep replies SHORT (1–2 sentences). Ask ONE question at a time.
 
 - If caller asks for a human/manager/desk, respond with:
@@ -48,7 +51,7 @@ ACTION_JSON: {"action":"book","service":"...","stylist":"...","datetime":"ISO_FO
 (When outputting ACTION_JSON, output ONLY that line.)
 `;
 
-// --- ElevenLabs TTS with logging ---
+// ---------- ELEVENLABS TTS ----------
 async function tts(text) {
   const safe = String(text).slice(0, 800);
   const voiceId = process.env.ELEVEN_VOICE_ID;
@@ -63,7 +66,7 @@ async function tts(text) {
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`;
 
   try {
-    const resp = await axios.post(
+    const resp = await http.post(
       url,
       {
         text: safe,
@@ -77,7 +80,7 @@ async function tts(text) {
           Accept: "audio/mpeg",
         },
         responseType: "arraybuffer",
-        timeout: 12000,
+        timeout: 8000, // keep this tight for Twilio stability
       }
     );
 
@@ -95,7 +98,6 @@ async function tts(text) {
   }
 }
 
-// Retry wrapper (top-level)
 async function ttsWithRetry(text, tries = 2) {
   let lastErr;
   for (let i = 0; i < tries; i++) {
@@ -108,6 +110,22 @@ async function ttsWithRetry(text, tries = 2) {
   throw lastErr;
 }
 
+// Pre-generated filler clips (still ElevenLabs voice)
+const clipIds = {
+  thinking: null, // "One moment…"
+  repeat: null,   // "Sorry—could you say that again?"
+};
+
+async function ensureClip(kind, text) {
+  if (clipIds[kind]) return clipIds[kind];
+  const audio = await ttsWithRetry(text);
+  const id = uuidv4();
+  audioStore.set(id, audio);
+  clipIds[kind] = id;
+  return id;
+}
+
+// ---------- HELPERS ----------
 function extractAction(text) {
   const m = text?.match(/ACTION_JSON:\s*(\{.*\})/s);
   if (!m) return null;
@@ -147,27 +165,72 @@ function formatTorontoConfirm(iso) {
   return `${weekday}, ${datePretty} at ${timePretty}`;
 }
 
+function nowISO() {
+  return new Date().toISOString();
+}
+
+function isCompleteBooking(action) {
+  return Boolean(
+    action &&
+      action.action === "book" &&
+      action.service &&
+      action.stylist &&
+      action.datetime &&
+      action.name &&
+      action.phone
+  );
+}
+
+function normalizePhone(s) {
+  const digits = String(s || "").replace(/\D/g, "");
+  if (!digits) return "";
+  // crude: keep last 10 if longer
+  if (digits.length > 10) return digits.slice(-10);
+  return digits;
+}
+
+function isYes(text) {
+  const t = String(text || "").trim().toLowerCase();
+  return /^(yes|yeah|yep|correct|that works|sounds good|ok|okay|sure)$/i.test(t);
+}
+
+// Cleanup so memory doesn't grow forever
+setInterval(() => {
+  // audio: keep last ~300 items
+  if (audioStore.size > 300) {
+    const keys = Array.from(audioStore.keys()).slice(0, audioStore.size - 300);
+    keys.forEach((k) => audioStore.delete(k));
+  }
+
+  // pendingTurns: expire after 2 minutes
+  const now = Date.now();
+  for (const [token, v] of pendingTurns.entries()) {
+    if (now - v.createdAt > 120_000) pendingTurns.delete(token);
+  }
+}, 30_000);
+
+// ---------- ROUTES ----------
+
 /**
  * Browser-friendly test endpoint (not used by Twilio)
  */
 app.get("/voice/incoming", async (req, res) => {
-  const greet = `Hi! Thanks for calling ${process.env.SALON_NAME || "the salon"}. How can I help you today?`;
   try {
+    const greet = `Hi! Thanks for calling ${process.env.SALON_NAME || "the salon"}. How can I help you today?`;
     const audio = await ttsWithRetry(greet);
     const id = uuidv4();
     audioStore.set(id, audio);
 
     const host = getHost(req);
-
     return res.type("text/xml").send(
 `<Response>
   <Play>${host}/audio/${id}.mp3</Play>
 </Response>`
     );
-  } catch {
+  } catch (e) {
     return res.type("text/xml").send(
 `<Response>
-  <Say>${greet}</Say>
+  <Say>Hi! Thanks for calling. How can I help you today?</Say>
 </Response>`
     );
   }
@@ -177,187 +240,237 @@ app.get("/voice/incoming", async (req, res) => {
  * Twilio webhook for incoming calls
  */
 app.post("/voice/incoming", async (req, res) => {
-  const greet = `Hi! Thanks for calling ${process.env.SALON_NAME || "the salon"}. How can I help you today?`;
-
   try {
+    const host = getHost(req);
+    const greet = `Hi! Thanks for calling ${process.env.SALON_NAME || "the salon"}. How can I help you today?`;
+
+    // Always ElevenLabs: generate greet (may take a second)
     const audio = await ttsWithRetry(greet);
     const id = uuidv4();
     audioStore.set(id, audio);
 
-    const host = getHost(req);
+    // Use absolute action URL for stability
+    const actionUrl = `${host}/voice/turn`;
 
     return res.type("text/xml").send(
 `<Response>
   <Play>${host}/audio/${id}.mp3</Play>
-  <Gather input="speech" action="/voice/turn" method="POST" speechTimeout="auto" />
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
 </Response>`
     );
-  } catch {
-    // Fallback if ElevenLabs fails
+  } catch (e) {
+    const host = getHost(req);
+    const actionUrl = `${host}/voice/turn`;
+    // If ElevenLabs completely fails, Twilio <Say> fallback is better than dropped calls
     return res.type("text/xml").send(
 `<Response>
-  <Say>${greet}</Say>
-  <Gather input="speech" action="/voice/turn" method="POST" speechTimeout="auto" />
+  <Say>Hi! Thanks for calling. How can I help you today?</Say>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
 </Response>`
     );
   }
 });
 
 /**
- * Twilio webhook for each conversation turn
+ * Turn handler: immediate filler audio + redirect polling until response is ready.
+ * This eliminates dead air while keeping ElevenLabs voice.
  */
 app.post("/voice/turn", async (req, res) => {
-  const callSid = req.body.CallSid || "no-callsid";
-  const userSpeech = req.body.SpeechResult || "";
+  try {
+    const host = getHost(req);
+    const callSid = req.body.CallSid || "no-callsid";
+    const userSpeech = req.body.SpeechResult || "";
 
-  // Init memory for this call
-  if (!conversationStore.has(callSid)) {
-    const now = new Date().toISOString();
-
-    conversationStore.set(callSid, [
-      {
-        role: "system",
-        content:
-          SYSTEM_PROMPT +
-          `
+    // Init memory for this call
+    if (!conversationStore.has(callSid)) {
+      const now = nowISO();
+      conversationStore.set(callSid, [
+        {
+          role: "system",
+          content:
+            SYSTEM_PROMPT +
+            `
 
 CURRENT_DATETIME: ${now}
 Timezone: America/Toronto
 Never book in the past.
 If no year is specified, assume the next upcoming future date.
-If user gives a date without weekday, do NOT invent the weekday.
 `,
-      },
-    ]);
-  }
+        },
+      ]);
+    }
 
-  const messages = conversationStore.get(callSid);
-  messages.push({ role: "user", content: userSpeech });
+    const messages = conversationStore.get(callSid);
+    messages.push({ role: "user", content: userSpeech });
 
-  // Ask OpenAI
-  let reply = "Sorry, could you repeat that?";
-  try {
-    const r = await axios.post(
-      "https://api.openai.com/v1/chat/completions",
-      {
-        model: "gpt-4o-mini",
-        temperature: 0.2,
-        max_tokens: 120,
-        messages,
-      },
-      {
-        headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-        timeout: 8000,
+    // Create a pending token for this turn
+    const token = uuidv4();
+    pendingTurns.set(token, { ready: false, twiml: "", createdAt: Date.now() });
+
+    // Kick off the expensive work in the background (don’t await here)
+    (async () => {
+      try {
+        // ---- OpenAI ----
+        let reply = "Sorry, could you repeat that?";
+
+        try {
+          const r = await http.post(
+            "https://api.openai.com/v1/chat/completions",
+            {
+              model: "gpt-4o-mini",
+              temperature: 0.2,
+              max_tokens: 120,
+              messages,
+            },
+            {
+              headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+              timeout: 8000,
+            }
+          );
+
+          reply = r.data.choices?.[0]?.message?.content?.trim() || reply;
+          messages.push({ role: "assistant", content: reply });
+        } catch (e) {
+          console.log("❌ OpenAI error", e?.response?.status, e?.response?.data || e?.message);
+        }
+
+        const action = extractAction(reply);
+        console.log("AI RAW REPLY:", reply);
+        console.log("PARSED ACTION:", action);
+
+        // ---- Build spoken text (server-controlled for actions) ----
+        let spoken = reply.replace(/ACTION_JSON:[\s\S]*$/, "").trim() || "Got it.";
+
+        // If the model tries to book without all required fields, ignore it and keep convo going
+        if (action?.action === "book" && !isCompleteBooking(action)) {
+          spoken = "Quick check—what’s the best phone number to confirm the booking?";
+        }
+
+        // Transfer
+        if (action?.action === "transfer" && process.env.SALON_PHONE) {
+          const transferLine = "Okay, I’ll connect you to the salon now.";
+          const audio = await ttsWithRetry(transferLine);
+          const id = uuidv4();
+          audioStore.set(id, audio);
+
+          const twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Dial>${process.env.SALON_PHONE}</Dial>
+</Response>`;
+
+          conversationStore.delete(callSid);
+          pendingTurns.set(token, { ready: true, twiml, createdAt: Date.now() });
+          return;
+        }
+
+        // Book (confirmed)
+        if (isCompleteBooking(action) && process.env.BOOKING_WEBHOOK_URL) {
+          // Safety: normalize phone
+          action.phone = normalizePhone(action.phone) || action.phone;
+
+          const pretty = formatTorontoConfirm(action.datetime) || action.datetime;
+          const finalLine = `Perfect ${action.name}. I’m booking you for a ${action.service} with ${action.stylist} on ${pretty}.`;
+
+          // Fire-and-forget to Zapier
+          http.post(process.env.BOOKING_WEBHOOK_URL, action).catch(() => {});
+
+          const audio = await ttsWithRetry(finalLine);
+          const id = uuidv4();
+          audioStore.set(id, audio);
+
+          const twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Hangup/>
+</Response>`;
+
+          conversationStore.delete(callSid);
+          pendingTurns.set(token, { ready: true, twiml, createdAt: Date.now() });
+          return;
+        }
+
+        // Normal conversational turn (always ElevenLabs if possible)
+        const audio = await ttsWithRetry(spoken);
+        const id = uuidv4();
+        audioStore.set(id, audio);
+
+        const actionUrl = `${host}/voice/turn`;
+        const twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+</Response>`;
+
+        pendingTurns.set(token, { ready: true, twiml, createdAt: Date.now() });
+      } catch (e) {
+        console.log("❌ Background turn error", e?.stack || e?.message || e);
+
+        // Fallback still returns *valid* TwiML so Twilio doesn’t drop the call
+        const actionUrl = `${host}/voice/turn`;
+        const twiml = `<Response>
+  <Say>Sorry—could you say that again?</Say>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+</Response>`;
+
+        pendingTurns.set(token, { ready: true, twiml, createdAt: Date.now() });
       }
+    })();
+
+    // ---- Immediate response: play filler clip + redirect to poll ----
+    const thinkingId = await ensureClip("thinking", "One moment.");
+    const pollUrl = `${host}/voice/turn/result?token=${encodeURIComponent(token)}`;
+
+    return res.type("text/xml").send(
+`<Response>
+  <Play>${host}/audio/${thinkingId}.mp3</Play>
+  <Redirect method="GET">${pollUrl}</Redirect>
+</Response>`
     );
-
-    reply = r.data.choices?.[0]?.message?.content?.trim() || reply;
-    messages.push({ role: "assistant", content: reply });
   } catch (e) {
-    console.log("❌ OpenAI error", e?.response?.status, e?.response?.data || e?.message);
-  }
-
-  const action = extractAction(reply);
-
-  console.log("AI RAW REPLY:", reply);
-  console.log("PARSED ACTION:", action);
-
-  // Build server-controlled spoken lines for actions (prevents ISO/weekday hallucinations)
-  let spokenOverride = null;
-
-  if (action?.action === "book" && action?.datetime) {
-    const pretty = formatTorontoConfirm(action.datetime) || action.datetime;
-    const svc = action.service || "service";
-    const st = action.stylist || "a stylist";
-    const nm = action.name ? `${action.name}, ` : "";
-    spokenOverride = `Perfect ${nm}I’m booking you for a ${svc} with ${st} on ${pretty}.`;
-  }
-
-  if (action?.action === "transfer") {
-    spokenOverride = `Okay, I’ll connect you to the salon now.`;
-  }
-
-  // Transfer to human
-  if (action?.action === "transfer" && process.env.SALON_PHONE) {
-    conversationStore.delete(callSid);
-
+    console.log("❌ /voice/turn UNCAUGHT", e?.stack || e?.message || e);
     const host = getHost(req);
-    try {
-      const audio = await ttsWithRetry(spokenOverride);
-      const id = uuidv4();
-      audioStore.set(id, audio);
-
-      return res.type("text/xml").send(
+    const actionUrl = `${host}/voice/turn`;
+    return res.type("text/xml").send(
 `<Response>
-  <Play>${host}/audio/${id}.mp3</Play>
-  <Dial>${process.env.SALON_PHONE}</Dial>
+  <Say>Sorry—could you say that again?</Say>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
 </Response>`
-      );
-    } catch {
-      return res.type("text/xml").send(
-`<Response>
-  <Say>${spokenOverride}</Say>
-  <Dial>${process.env.SALON_PHONE}</Dial>
-</Response>`
-      );
-    }
+    );
   }
+});
 
-  // Book: speak confirmation, send to webhook, then end call
-  if (action?.action === "book" && process.env.BOOKING_WEBHOOK_URL) {
-    axios.post(process.env.BOOKING_WEBHOOK_URL, action).catch(() => {});
-    conversationStore.delete(callSid);
-
-    const host = getHost(req);
-    const finalSpoken =
-      spokenOverride ||
-      "Perfect. Your appointment request has been submitted. We look forward to seeing you.";
-
-    try {
-      const audio = await ttsWithRetry(finalSpoken);
-      const id = uuidv4();
-      audioStore.set(id, audio);
-
-      return res.type("text/xml").send(
-`<Response>
-  <Play>${host}/audio/${id}.mp3</Play>
-  <Hangup/>
-</Response>`
-      );
-    } catch {
-      return res.type("text/xml").send(
-`<Response>
-  <Say>${finalSpoken}</Say>
-  <Hangup/>
-</Response>`
-      );
-    }
-  }
-
-  // Normal speech output
-  const cleanedReply = reply.replace(/ACTION_JSON:[\s\S]*$/, "").trim();
-  const spoken = (spokenOverride || cleanedReply || "Got it.").replace(/\s+/g, " ");
-
-  const host = getHost(req);
-
-  // Try ElevenLabs audio; fall back to <Say>
+/**
+ * Poll endpoint for a pending turn.
+ * If not ready, we keep the call alive with a brief pause + filler + redirect.
+ */
+app.get("/voice/turn/result", async (req, res) => {
   try {
-    const audio = await ttsWithRetry(spoken);
-    const id = uuidv4();
-    audioStore.set(id, audio);
+    const host = getHost(req);
+    const token = String(req.query.token || "");
+    const pending = pendingTurns.get(token);
+
+    if (pending?.ready && pending.twiml) {
+      pendingTurns.delete(token);
+      return res.type("text/xml").send(pending.twiml);
+    }
+
+    // Not ready yet: keep Twilio alive
+    const thinkingId = await ensureClip("thinking", "One moment.");
+    const pollUrl = `${host}/voice/turn/result?token=${encodeURIComponent(token)}`;
 
     return res.type("text/xml").send(
 `<Response>
-  <Play>${host}/audio/${id}.mp3</Play>
-  <Gather input="speech" action="/voice/turn" method="POST" speechTimeout="auto" />
+  <Pause length="1" />
+  <Play>${host}/audio/${thinkingId}.mp3</Play>
+  <Redirect method="GET">${pollUrl}</Redirect>
 </Response>`
     );
   } catch (e) {
-    console.log("❌ TTS error", e?.response?.status, e?.response?.data || e?.message);
+    console.log("❌ /voice/turn/result error", e?.stack || e?.message || e);
+    const host = getHost(req);
+    const actionUrl = `${host}/voice/turn`;
     return res.type("text/xml").send(
 `<Response>
-  <Say>${spoken}</Say>
-  <Gather input="speech" action="/voice/turn" method="POST" speechTimeout="auto" />
+  <Say>Sorry—could you say that again?</Say>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
 </Response>`
     );
   }
@@ -384,10 +497,14 @@ app.get("/env-check", (_, res) => {
     OPENAI_API_KEY_len: process.env.OPENAI_API_KEY?.length || 0,
     BOOKING_WEBHOOK_URL: process.env.BOOKING_WEBHOOK_URL ? "set" : "missing",
     SALON_PHONE: process.env.SALON_PHONE || "missing",
+    clips: {
+      thinking: clipIds.thinking ? "ready" : "missing",
+      repeat: clipIds.repeat ? "ready" : "missing",
+    },
   });
 });
 
-app.get("/tts-test", async (req, res) => {
+app.get("/tts-test", async (_req, res) => {
   try {
     const audio = await ttsWithRetry("Hi, this is the server speaking. ElevenLabs is working.");
     res.set("Content-Type", "audio/mpeg");
