@@ -133,9 +133,10 @@ async function ttsWithRetry(text, tries = 2) {
 
 async function ensureClip(kind, text) {
   if (clipIds[kind]) return clipIds[kind];
-  const audio = await ttsWithRetry(text);
-  const id = uuidv4();
-  audioStore.set(id, audio);
+  let audio = await ttsWithRetry(text);
+audio = await mixSpeechWithAmbient(audio);
+const id = uuidv4();
+audioStore.set(id, audio);
   clipIds[kind] = id;
   return id;
 }
@@ -143,10 +144,11 @@ async function ensureClip(kind, text) {
 async function warmFillers() {
   try {
     for (const line of fillerText) {
-      const audio = await ttsWithRetry(line);
-      const id = uuidv4();
-      audioStore.set(id, audio);
-      fillerIds.push(id);
+      let audio = await ttsWithRetry(line);
+audio = await mixSpeechWithAmbient(audio);   // ✅ add this
+const id = uuidv4();
+audioStore.set(id, audio);
+fillerIds.push(id);
     }
     await ensureClip("repeat", "Sorry—could you say that again?");
     console.log(`✅ Warmed fillers: ${fillerIds.length} | repeat clip ready`);
@@ -506,7 +508,8 @@ setInterval(() => {
 app.get("/voice/incoming", async (req, res) => {
   try {
     const greet = `Hi! Thanks for calling ${process.env.SALON_NAME || "the salon"}. How can I help you today?`;
-    const audio = await ttsWithRetry(greet);
+    let audio = await ttsWithRetry(greet);
+    audio = await mixSpeechWithAmbient(audio);
     const id = uuidv4();
     audioStore.set(id, audio);
 
@@ -534,7 +537,8 @@ app.post("/voice/incoming", async (req, res) => {
 
   try {
     const greet = `Hi! Thanks for calling ${process.env.SALON_NAME || "the salon"}. How can I help you today?`;
-    const audio = await ttsWithRetry(greet);
+    let audio = await ttsWithRetry(greet);
+    audio = await mixSpeechWithAmbient(audio);   // ✅ this is the merge
     const id = uuidv4();
     audioStore.set(id, audio);
 
