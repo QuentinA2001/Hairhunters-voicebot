@@ -108,6 +108,31 @@ function getHost(req) {
   return BASE_URL || `https://${req.headers.host}`;
 }
 
+function formatTorontoConfirm(iso) {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return null;
+
+  const weekday = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Toronto",
+    weekday: "long",
+  }).format(d);
+
+  const datePretty = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Toronto",
+    month: "long",
+    day: "numeric",
+  }).format(d);
+
+  const timePretty = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Toronto",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  }).format(d);
+
+  return `${weekday}, ${datePretty} at ${timePretty}`;
+}
+
 /**
  * Browser-friendly test endpoint (not used by Twilio)
  */
