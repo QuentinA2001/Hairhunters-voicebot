@@ -20,7 +20,7 @@ const BASE_URL = process.env.BASE_URL || "";
 // In-memory stores (OK for MVP; use Redis/S3 for production)
 const audioStore = new Map();            // id -> Buffer(mp3)
 const conversationStore = new Map();     // callSid -> messages[]
-const pendingTurns = new Map();          // token -> { ready:boolean, twiml:string, createdAt:number }
+const pendingTurns = new Map();          // token -> { ready, twiml, createdAt, fillerId, fillerPlayed }
 
 // Keep-alive HTTP client (reduces latency)
 const httpsAgent = new https.Agent({ keepAlive: true });
@@ -28,6 +28,20 @@ const http = axios.create({ httpsAgent, timeout: 12000 });
 
 // Small helper for log redaction
 const pick = (v) => (v ? String(v).slice(0, 6) + "…" : "missing");
+
+// ---------- FILLERS (pre-generated ElevenLabs clips) ----------
+const fillerText = ["One sec.", "Got it.", "Okay.", "Alright."];
+const fillerIds = []; // mp3 ids ready to use
+
+function pickFillerId() {
+  if (!fillerIds.length) return null;
+  return fillerIds[Math.floor(Math.random() * fillerIds.length)];
+}
+
+// Pre-generated clips you may want (ElevenLabs voice)
+const clipIds = {
+  repeat: null, // "Sorry—could you say that again?"
+};
 
 // ---------- PROMPT ----------
 const SYSTEM_PROMPT = `
@@ -41,6 +55,7 @@ Tasks:
 - datetime MUST be ISO format like: 2026-02-21T15:00:00-05:00
 - Do NOT state the weekday (Monday/Tuesday/etc) unless the caller already said it. (The server will confirm day-of-week.)
 - Keep replies SHORT (1–2 sentences). Ask ONE question at a time.
+- When you say the time back to the caller to confirm, you need to say it in natural language like "Saturday at 2 o'clock pm" and not the ISO format
 
 - If caller asks for a human/manager/desk, respond with:
 ACTION_JSON: {"action":"transfer"}
@@ -80,7 +95,7 @@ async function tts(text) {
           Accept: "audio/mpeg",
         },
         responseType: "arraybuffer",
-        timeout: 8000, // keep this tight for Twilio stability
+        timeout: 8000,
       }
     );
 
@@ -110,12 +125,6 @@ async function ttsWithRetry(text, tries = 2) {
   throw lastErr;
 }
 
-// Pre-generated filler clips (still ElevenLabs voice)
-const clipIds = {
-  thinking: null, // "One moment…"
-  repeat: null,   // "Sorry—could you say that again?"
-};
-
 async function ensureClip(kind, text) {
   if (clipIds[kind]) return clipIds[kind];
   const audio = await ttsWithRetry(text);
@@ -123,6 +132,25 @@ async function ensureClip(kind, text) {
   audioStore.set(id, audio);
   clipIds[kind] = id;
   return id;
+}
+
+async function warmFillers() {
+  try {
+    // pre-generate filler lines
+    for (const line of fillerText) {
+      const audio = await ttsWithRetry(line);
+      const id = uuidv4();
+      audioStore.set(id, audio);
+      fillerIds.push(id);
+    }
+
+    // pre-generate repeat clip
+    await ensureClip("repeat", "Sorry—could you say that again?");
+
+    console.log(`✅ Warmed fillers: ${fillerIds.length} | repeat clip ready`);
+  } catch (e) {
+    console.log("⚠️ warmFillers failed (server will still run):", e?.message || e);
+  }
 }
 
 // ---------- HELPERS ----------
@@ -184,14 +212,8 @@ function isCompleteBooking(action) {
 function normalizePhone(s) {
   const digits = String(s || "").replace(/\D/g, "");
   if (!digits) return "";
-  // crude: keep last 10 if longer
   if (digits.length > 10) return digits.slice(-10);
   return digits;
-}
-
-function isYes(text) {
-  const t = String(text || "").trim().toLowerCase();
-  return /^(yes|yeah|yep|correct|that works|sounds good|ok|okay|sure)$/i.test(t);
 }
 
 // Cleanup so memory doesn't grow forever
@@ -227,7 +249,7 @@ app.get("/voice/incoming", async (req, res) => {
   <Play>${host}/audio/${id}.mp3</Play>
 </Response>`
     );
-  } catch (e) {
+  } catch {
     return res.type("text/xml").send(
 `<Response>
   <Say>Hi! Thanks for calling. How can I help you today?</Say>
@@ -240,17 +262,14 @@ app.get("/voice/incoming", async (req, res) => {
  * Twilio webhook for incoming calls
  */
 app.post("/voice/incoming", async (req, res) => {
-  try {
-    const host = getHost(req);
-    const greet = `Hi! Thanks for calling ${process.env.SALON_NAME || "the salon"}. How can I help you today?`;
+  const host = getHost(req);
+  const actionUrl = `${host}/voice/turn`;
 
-    // Always ElevenLabs: generate greet (may take a second)
+  try {
+    const greet = `Hi! Thanks for calling ${process.env.SALON_NAME || "the salon"}. How can I help you today?`;
     const audio = await ttsWithRetry(greet);
     const id = uuidv4();
     audioStore.set(id, audio);
-
-    // Use absolute action URL for stability
-    const actionUrl = `${host}/voice/turn`;
 
     return res.type("text/xml").send(
 `<Response>
@@ -258,10 +277,7 @@ app.post("/voice/incoming", async (req, res) => {
   <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
 </Response>`
     );
-  } catch (e) {
-    const host = getHost(req);
-    const actionUrl = `${host}/voice/turn`;
-    // If ElevenLabs completely fails, Twilio <Say> fallback is better than dropped calls
+  } catch {
     return res.type("text/xml").send(
 `<Response>
   <Say>Hi! Thanks for calling. How can I help you today?</Say>
@@ -272,12 +288,14 @@ app.post("/voice/incoming", async (req, res) => {
 });
 
 /**
- * Turn handler: immediate filler audio + redirect polling until response is ready.
- * This eliminates dead air while keeping ElevenLabs voice.
+ * Turn handler: respond immediately with ONE filler clip + redirect to polling.
+ * Background task generates the real response + stores final TwiML in pendingTurns.
  */
 app.post("/voice/turn", async (req, res) => {
+  const host = getHost(req);
+  const actionUrl = `${host}/voice/turn`;
+
   try {
-    const host = getHost(req);
     const callSid = req.body.CallSid || "no-callsid";
     const userSpeech = req.body.SpeechResult || "";
 
@@ -303,15 +321,26 @@ If no year is specified, assume the next upcoming future date.
     const messages = conversationStore.get(callSid);
     messages.push({ role: "user", content: userSpeech });
 
-    // Create a pending token for this turn
+    // Create pending token for this turn
     const token = uuidv4();
-    pendingTurns.set(token, { ready: false, twiml: "", createdAt: Date.now() });
+    const fillerId = pickFillerId(); // prewarmed (fast)
 
-    // Kick off the expensive work in the background (don’t await here)
+    pendingTurns.set(token, {
+      ready: false,
+      twiml: "",
+      createdAt: Date.now(),
+      fillerId,
+      fillerPlayed: false,
+    });
+
+    // Background work (don’t await)
     (async () => {
+      const entry = pendingTurns.get(token);
+      if (!entry) return;
+
       try {
         // ---- OpenAI ----
-        let reply = "Sorry, could you repeat that?";
+        let reply = "Sorry—could you say that again?";
 
         try {
           const r = await http.post(
@@ -319,7 +348,7 @@ If no year is specified, assume the next upcoming future date.
             {
               model: "gpt-4o-mini",
               temperature: 0.2,
-              max_tokens: 120,
+              max_tokens: 100,
               messages,
             },
             {
@@ -338,10 +367,10 @@ If no year is specified, assume the next upcoming future date.
         console.log("AI RAW REPLY:", reply);
         console.log("PARSED ACTION:", action);
 
-        // ---- Build spoken text (server-controlled for actions) ----
+        // Spoken (strip ACTION_JSON if present)
         let spoken = reply.replace(/ACTION_JSON:[\s\S]*$/, "").trim() || "Got it.";
 
-        // If the model tries to book without all required fields, ignore it and keep convo going
+        // If model tries to book without full payload, keep convo going
         if (action?.action === "book" && !isCompleteBooking(action)) {
           spoken = "Quick check—what’s the best phone number to confirm the booking?";
         }
@@ -353,19 +382,18 @@ If no year is specified, assume the next upcoming future date.
           const id = uuidv4();
           audioStore.set(id, audio);
 
-          const twiml = `<Response>
+          entry.ready = true;
+          entry.twiml = `<Response>
   <Play>${host}/audio/${id}.mp3</Play>
   <Dial>${process.env.SALON_PHONE}</Dial>
 </Response>`;
 
           conversationStore.delete(callSid);
-          pendingTurns.set(token, { ready: true, twiml, createdAt: Date.now() });
           return;
         }
 
         // Book (confirmed)
         if (isCompleteBooking(action) && process.env.BOOKING_WEBHOOK_URL) {
-          // Safety: normalize phone
           action.phone = normalizePhone(action.phone) || action.phone;
 
           const pretty = formatTorontoConfirm(action.datetime) || action.datetime;
@@ -378,56 +406,64 @@ If no year is specified, assume the next upcoming future date.
           const id = uuidv4();
           audioStore.set(id, audio);
 
-          const twiml = `<Response>
+          entry.ready = true;
+          entry.twiml = `<Response>
   <Play>${host}/audio/${id}.mp3</Play>
   <Hangup/>
 </Response>`;
 
           conversationStore.delete(callSid);
-          pendingTurns.set(token, { ready: true, twiml, createdAt: Date.now() });
           return;
         }
 
-        // Normal conversational turn (always ElevenLabs if possible)
+        // Normal turn
         const audio = await ttsWithRetry(spoken);
         const id = uuidv4();
         audioStore.set(id, audio);
 
-        const actionUrl = `${host}/voice/turn`;
-        const twiml = `<Response>
+        entry.ready = true;
+        entry.twiml = `<Response>
   <Play>${host}/audio/${id}.mp3</Play>
   <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
 </Response>`;
-
-        pendingTurns.set(token, { ready: true, twiml, createdAt: Date.now() });
       } catch (e) {
         console.log("❌ Background turn error", e?.stack || e?.message || e);
 
-        // Fallback still returns *valid* TwiML so Twilio doesn’t drop the call
-        const actionUrl = `${host}/voice/turn`;
-        const twiml = `<Response>
-  <Say>Sorry—could you say that again?</Say>
+        const repeatId = clipIds.repeat || (await ensureClip("repeat", "Sorry—could you say that again?"));
+
+        entry.ready = true;
+        entry.twiml = `<Response>
+  <Play>${host}/audio/${repeatId}.mp3</Play>
   <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
 </Response>`;
-
-        pendingTurns.set(token, { ready: true, twiml, createdAt: Date.now() });
       }
     })();
 
-    // ---- Immediate response: play filler clip + redirect to poll ----
-    const thinkingId = await ensureClip("thinking", "One moment.");
+    // Immediate TwiML: play ONE filler clip (if available), then redirect to poll
     const pollUrl = `${host}/voice/turn/result?token=${encodeURIComponent(token)}`;
 
+    if (fillerId) {
+      // mark as played so poll doesn't replay
+      const entry = pendingTurns.get(token);
+      if (entry) entry.fillerPlayed = true;
+
+      return res.type("text/xml").send(
+`<Response>
+  <Play>${host}/audio/${fillerId}.mp3</Play>
+  <Redirect method="GET">${pollUrl}</Redirect>
+</Response>`
+      );
+    }
+
+    // If fillers aren't warmed yet, just pause and redirect (still keeps call alive)
     return res.type("text/xml").send(
 `<Response>
-  <Play>${host}/audio/${thinkingId}.mp3</Play>
+  <Pause length="1" />
   <Redirect method="GET">${pollUrl}</Redirect>
 </Response>`
     );
   } catch (e) {
     console.log("❌ /voice/turn UNCAUGHT", e?.stack || e?.message || e);
-    const host = getHost(req);
-    const actionUrl = `${host}/voice/turn`;
     return res.type("text/xml").send(
 `<Response>
   <Say>Sorry—could you say that again?</Say>
@@ -438,12 +474,14 @@ If no year is specified, assume the next upcoming future date.
 });
 
 /**
- * Poll endpoint for a pending turn.
- * If not ready, we keep the call alive with a brief pause + filler + redirect.
+ * Poll endpoint: if not ready, DO NOT play filler again (prevents repeats).
+ * Just pause + redirect until the final TwiML is ready.
  */
 app.get("/voice/turn/result", async (req, res) => {
+  const host = getHost(req);
+  const actionUrl = `${host}/voice/turn`;
+
   try {
-    const host = getHost(req);
     const token = String(req.query.token || "");
     const pending = pendingTurns.get(token);
 
@@ -452,21 +490,27 @@ app.get("/voice/turn/result", async (req, res) => {
       return res.type("text/xml").send(pending.twiml);
     }
 
-    // Not ready yet: keep Twilio alive
-    const thinkingId = await ensureClip("thinking", "One moment.");
+    // token missing/expired -> recover gracefully
+    if (!pending) {
+      const repeatId = clipIds.repeat || (await ensureClip("repeat", "Sorry—could you say that again?"));
+      return res.type("text/xml").send(
+`<Response>
+  <Play>${host}/audio/${repeatId}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+</Response>`
+      );
+    }
+
     const pollUrl = `${host}/voice/turn/result?token=${encodeURIComponent(token)}`;
 
     return res.type("text/xml").send(
 `<Response>
   <Pause length="1" />
-  <Play>${host}/audio/${thinkingId}.mp3</Play>
   <Redirect method="GET">${pollUrl}</Redirect>
 </Response>`
     );
   } catch (e) {
     console.log("❌ /voice/turn/result error", e?.stack || e?.message || e);
-    const host = getHost(req);
-    const actionUrl = `${host}/voice/turn`;
     return res.type("text/xml").send(
 `<Response>
   <Say>Sorry—could you say that again?</Say>
@@ -497,10 +541,9 @@ app.get("/env-check", (_, res) => {
     OPENAI_API_KEY_len: process.env.OPENAI_API_KEY?.length || 0,
     BOOKING_WEBHOOK_URL: process.env.BOOKING_WEBHOOK_URL ? "set" : "missing",
     SALON_PHONE: process.env.SALON_PHONE || "missing",
-    clips: {
-      thinking: clipIds.thinking ? "ready" : "missing",
-      repeat: clipIds.repeat ? "ready" : "missing",
-    },
+    fillerCount: fillerIds.length,
+    repeatClip: clipIds.repeat ? "ready" : "missing",
+    pendingTurns: pendingTurns.size,
   });
 });
 
@@ -518,4 +561,9 @@ app.get("/tts-test", async (_req, res) => {
 app.get("/", (_, res) => res.send("Hair Hunters Voicebot is running ✅"));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Voice bot running on port ${PORT}`));
+
+(async () => {
+  // Don’t block server start forever, but try warming quickly.
+  await warmFillers();
+  app.listen(PORT, () => console.log(`Voice bot running on port ${PORT}`));
+})();
