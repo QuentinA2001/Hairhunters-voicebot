@@ -33,6 +33,8 @@ Tasks:
 - Assume timezone America/Toronto unless otherwise specified.
 - Convert natural language like "Friday at 3pm" into ISO 8601.
 - datetime MUST be ISO format like: 2026-02-21T15:00:00-05:00
+- When confirming appointments, always convert ISO date strings into natural spoken format like "Friday, February 20 at 3:00 PM".
+Never read raw ISO timestamps.
 
 - Keep replies SHORT (1–2 sentences). Ask ONE question at a time.
 
