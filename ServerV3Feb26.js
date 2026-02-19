@@ -316,7 +316,7 @@ function formatTorontoConfirm(iso) {
   const timePretty = new Intl.DateTimeFormat("en-CA", {
     timeZone: "America/Toronto",
     hour: "numeric",
-    minute: "2-digit",
+    minute: "numeric",
     hour12: true,
   }).format(d);
 
