@@ -30,6 +30,7 @@ You are a concise, warm, bubbly phone receptionist for ${process.env.SALON_NAME 
 
 Tasks:
 - Handle bookings/reschedules. Collect: name, phone (Confirm the phone number after they say it), service (haircut/colour/cut & colour), stylist (Cosmo, Vince, Cassidy), and day/time window.
+- Do NOT ask for email.
 - Assume timezone America/Toronto unless otherwise specified.
 - Convert natural language like "Friday at 3pm" into ISO 8601.
 - datetime MUST be ISO format like: 2026-02-21T15:00:00-05:00
@@ -58,17 +59,6 @@ async function tts(text) {
     err.code = "ELEVEN_MISSING_ENV";
     throw err;
   }
-async function ttsWithRetry(text, tries = 2) {
-  let lastErr;
-  for (let i = 0; i < tries; i++) {
-    try { 
-      return await ttsWithRetry(text); 
-    } catch (e) { 
-      lastErr = e; 
-    }
-  }
-  throw lastErr;
-}
 
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`;
 
@@ -103,6 +93,19 @@ async function ttsWithRetry(text, tries = 2) {
     });
     throw e;
   }
+}
+
+// Retry wrapper (top-level)
+async function ttsWithRetry(text, tries = 2) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await tts(text);
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr;
 }
 
 function extractAction(text) {
@@ -209,21 +212,25 @@ app.post("/voice/turn", async (req, res) => {
 
   // Init memory for this call
   if (!conversationStore.has(callSid)) {
-  const now = new Date().toISOString();
+    const now = new Date().toISOString();
 
-  conversationStore.set(callSid, [
-    { 
-      role: "system", 
-      content: SYSTEM_PROMPT + `
+    conversationStore.set(callSid, [
+      {
+        role: "system",
+        content:
+          SYSTEM_PROMPT +
+          `
 
 CURRENT_DATETIME: ${now}
 Timezone: America/Toronto
 Never book in the past.
 If no year is specified, assume the next upcoming future date.
-`
-    }
-  ]);
-}
+If user gives a date without weekday, do NOT invent the weekday.
+`,
+      },
+    ]);
+  }
+
   const messages = conversationStore.get(callSid);
   messages.push({ role: "user", content: userSpeech });
 
@@ -235,7 +242,7 @@ If no year is specified, assume the next upcoming future date.
       {
         model: "gpt-4o-mini",
         temperature: 0.2,
-        max_tokens: 80,
+        max_tokens: 120,
         messages,
       },
       {
@@ -255,33 +262,81 @@ If no year is specified, assume the next upcoming future date.
   console.log("AI RAW REPLY:", reply);
   console.log("PARSED ACTION:", action);
 
+  // Build server-controlled spoken lines for actions (prevents ISO/weekday hallucinations)
+  let spokenOverride = null;
+
+  if (action?.action === "book" && action?.datetime) {
+    const pretty = formatTorontoConfirm(action.datetime) || action.datetime;
+    const svc = action.service || "service";
+    const st = action.stylist || "a stylist";
+    const nm = action.name ? `${action.name}, ` : "";
+    spokenOverride = `Perfect ${nm}I’m booking you for a ${svc} with ${st} on ${pretty}.`;
+  }
+
+  if (action?.action === "transfer") {
+    spokenOverride = `Okay, I’ll connect you to the salon now.`;
+  }
+
   // Transfer to human
   if (action?.action === "transfer" && process.env.SALON_PHONE) {
     conversationStore.delete(callSid);
-    return res.type("text/xml").send(
+
+    const host = getHost(req);
+    try {
+      const audio = await ttsWithRetry(spokenOverride);
+      const id = uuidv4();
+      audioStore.set(id, audio);
+
+      return res.type("text/xml").send(
 `<Response>
-  <Say>Okay, I’ll connect you to the salon now.</Say>
+  <Play>${host}/audio/${id}.mp3</Play>
   <Dial>${process.env.SALON_PHONE}</Dial>
 </Response>`
-    );
+      );
+    } catch {
+      return res.type("text/xml").send(
+`<Response>
+  <Say>${spokenOverride}</Say>
+  <Dial>${process.env.SALON_PHONE}</Dial>
+</Response>`
+      );
+    }
   }
 
-  // Book: send to webhook and end call
+  // Book: speak confirmation, send to webhook, then end call
   if (action?.action === "book" && process.env.BOOKING_WEBHOOK_URL) {
     axios.post(process.env.BOOKING_WEBHOOK_URL, action).catch(() => {});
     conversationStore.delete(callSid);
 
-    return res.type("text/xml").send(
+    const host = getHost(req);
+    const finalSpoken =
+      spokenOverride ||
+      "Perfect. Your appointment request has been submitted. We look forward to seeing you.";
+
+    try {
+      const audio = await ttsWithRetry(finalSpoken);
+      const id = uuidv4();
+      audioStore.set(id, audio);
+
+      return res.type("text/xml").send(
 `<Response>
-  <Say>Your appointment request has been submitted. We look forward to seeing you.</Say>
+  <Play>${host}/audio/${id}.mp3</Play>
   <Hangup/>
 </Response>`
-    );
+      );
+    } catch {
+      return res.type("text/xml").send(
+`<Response>
+  <Say>${finalSpoken}</Say>
+  <Hangup/>
+</Response>`
+      );
+    }
   }
 
-  // Normal speech output (strip ACTION_JSON if present)
-  const spoken =
-    (action ? "" : reply.replace(/ACTION_JSON:[\s\S]*$/, "").trim()) || "Got it.";
+  // Normal speech output
+  const cleanedReply = reply.replace(/ACTION_JSON:[\s\S]*$/, "").trim();
+  const spoken = (spokenOverride || cleanedReply || "Got it.").replace(/\s+/g, " ");
 
   const host = getHost(req);
 
@@ -334,7 +389,7 @@ app.get("/env-check", (_, res) => {
 
 app.get("/tts-test", async (req, res) => {
   try {
-    const audio = await ttsWithRetry("Hi, this is the Render server speaking. ElevenLabs is working.");
+    const audio = await ttsWithRetry("Hi, this is the server speaking. ElevenLabs is working.");
     res.set("Content-Type", "audio/mpeg");
     res.send(audio);
   } catch (err) {
