@@ -20,8 +20,8 @@ const BASE_URL = process.env.BASE_URL || "";
 // In-memory stores (OK for MVP; use Redis/S3 for production)
 const audioStore = new Map();            // id -> Buffer(mp3)
 const conversationStore = new Map();     // callSid -> messages[]
-const pendingTurns = new Map();          // token -> { ready, twiml, createdAt, fillerId, fillerPlayed }
-const pendingBookings = new Map();       // callSid -> booking payload waiting for "yes"
+const pendingTurns = new Map();          // token -> { ready, twiml, createdAt, fillerId }
+const pendingBookings = new Map();       // callSid -> booking payload waiting for confirm
 
 // Keep-alive HTTP client (reduces latency)
 const httpsAgent = new https.Agent({ keepAlive: true });
@@ -51,9 +51,9 @@ Tasks:
 - Handle bookings/reschedules. Collect: name, phone (Confirm the phone number after they say it), service (haircut/colour/cut & colour), stylist (Cosmo, Vince, Cassidy), and day/time window.
 - Do NOT ask for email.
 - Assume timezone America/Toronto unless otherwise specified.
-- Convert natural language like "Friday at 3pm" into ISO 8601 with timezone offset.
+- Convert natural language like "Tuesday at 4" into ISO 8601 with timezone offset.
 - datetime MUST be ISO format like: 2026-02-21T15:00:00-05:00
-- Do NOT state the weekday (Monday/Tuesday/etc) unless the caller already said it. (The server will confirm day-of-week.)
+- Do NOT state the weekday (Monday/Tuesday/etc) unless the caller already said it. (The server will confirm weekday.)
 - Keep replies SHORT (1–2 sentences). Ask ONE question at a time.
 - When you say the time back to the caller to confirm, speak in natural language (NOT ISO).
 
@@ -188,8 +188,9 @@ function formatTorontoConfirm(iso) {
   return `${weekday}, ${datePretty} at ${timePretty}`;
 }
 
-function nowISO() {
-  return new Date().toISOString();
+function torontoNowString() {
+  // human-readable, Toronto-local, avoids UTC confusion
+  return new Date().toLocaleString("en-CA", { timeZone: "America/Toronto" });
 }
 
 function isCompleteBooking(action) {
@@ -213,17 +214,37 @@ function normalizePhone(s) {
 
 function isYes(text) {
   const t = String(text || "").trim().toLowerCase();
-  return /^(yes|yeah|yep|correct|that works|sounds good|ok|okay|sure|confirm)$/i.test(t);
+  return /^(yes|yeah|yep|correct|that works|sounds good|ok|okay|sure|confirm|yup)$/i.test(t);
 }
 
 function isNo(text) {
   const t = String(text || "").trim().toLowerCase();
-  return /^(no|nope|nah|negative|not really)$/i.test(t);
+  return /^(no|nope|nah|negative|not really|incorrect)$/i.test(t);
+}
+
+function wantsHuman(text) {
+  const t = String(text || "").toLowerCase();
+  return /(human|manager|front desk|desk|reception|someone|representative|staff|person|talk to)/i.test(t);
+}
+
+function sanitizeSpoken(text) {
+  let out = String(text || "");
+
+  // Replace ISO timestamps with a Toronto-friendly phrase
+  out = out.replace(
+    /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?[+-]\d{2}:\d{2}/g,
+    (iso) => formatTorontoConfirm(iso) || "that time"
+  );
+
+  // If any raw date slips through
+  out = out.replace(/\b\d{4}-\d{2}-\d{2}\b/g, "that date");
+
+  return out;
 }
 
 /**
- * ✅ Post booking to Zapier and REQUIRE success.
- * If Zapier fails, we do NOT hang up — we keep the caller in the loop.
+ * Post booking to Zapier and REQUIRE success.
+ * If Zapier fails, do NOT hang up — keep caller in the loop.
  */
 async function postBookingToZapier(payload) {
   const url = process.env.BOOKING_WEBHOOK_URL;
@@ -255,7 +276,7 @@ setInterval(() => {
     if (now - v.createdAt > 120_000) pendingTurns.delete(token);
   }
 
-  // pendingBookings: expire after 10 minutes (in case call drops)
+  // pendingBookings: expire after 10 minutes
   for (const [sid, v] of pendingBookings.entries()) {
     if (now - (v._createdAt || now) > 600_000) pendingBookings.delete(sid);
   }
@@ -318,7 +339,7 @@ app.post("/voice/incoming", async (req, res) => {
 });
 
 /**
- * Turn handler: respond immediately with ONE filler clip + redirect to polling.
+ * Turn handler: immediate filler + redirect polling until response is ready.
  * Background task generates the real response + stores final TwiML in pendingTurns.
  */
 app.post("/voice/turn", async (req, res) => {
@@ -329,9 +350,8 @@ app.post("/voice/turn", async (req, res) => {
     const callSid = req.body.CallSid || "no-callsid";
     const userSpeech = req.body.SpeechResult || "";
 
-    // Init memory for this call
+    // Init memory for this call (Toronto-local now)
     if (!conversationStore.has(callSid)) {
-      const now = nowISO();
       conversationStore.set(callSid, [
         {
           role: "system",
@@ -339,7 +359,7 @@ app.post("/voice/turn", async (req, res) => {
             SYSTEM_PROMPT +
             `
 
-CURRENT_DATETIME: ${now}
+CURRENT_DATETIME_TORONTO: ${torontoNowString()}
 Timezone: America/Toronto
 Never book in the past.
 If no year is specified, assume the next upcoming future date.
@@ -360,7 +380,6 @@ If no year is specified, assume the next upcoming future date.
       twiml: "",
       createdAt: Date.now(),
       fillerId,
-      fillerPlayed: false,
     });
 
     // Background work (don’t await)
@@ -369,9 +388,9 @@ If no year is specified, assume the next upcoming future date.
       if (!entry) return;
 
       try {
-        // ✅ SERVER-SIDE CONFIRMATION HANDLER
         const pendingBooking = pendingBookings.get(callSid);
 
+        // ✅ If we were in confirm state and they say YES: post + hang up (only if Zapier succeeds)
         if (pendingBooking && isYes(userSpeech)) {
           const pretty = formatTorontoConfirm(pendingBooking.datetime) || pendingBooking.datetime;
 
@@ -397,7 +416,7 @@ If no year is specified, assume the next upcoming future date.
             console.log("❌ Booking post failed, NOT hanging up:", err?.message || err);
 
             const failLine =
-              "Sorry — I couldn’t save that appointment right now. Do you want to try a different time, or should I connect you to the salon?";
+              "Sorry — I couldn’t save that appointment right now. Do you want to try again, or should I connect you to the salon?";
             const audio = await ttsWithRetry(failLine);
             const id = uuidv4();
             audioStore.set(id, audio);
@@ -411,10 +430,11 @@ If no year is specified, assume the next upcoming future date.
           }
         }
 
+        // ✅ If we were in confirm state and they say NO: clear pending + ask correction (never transfer)
         if (pendingBooking && isNo(userSpeech)) {
           pendingBookings.delete(callSid);
 
-          const line = "No problem—what would you like to change? The day, the time, or the stylist?";
+          const line = "No problem — what should I change? The day, the time, or the stylist?";
           const audio = await ttsWithRetry(line);
           const id = uuidv4();
           audioStore.set(id, audio);
@@ -425,6 +445,17 @@ If no year is specified, assume the next upcoming future date.
   <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
 </Response>`;
           return;
+        }
+
+        // ✅ If there was a pending booking and user is correcting (e.g., “Tuesday at 4”), force re-parse and keep old fields
+        if (pendingBooking && !isYes(userSpeech) && !isNo(userSpeech)) {
+          messages.push({
+            role: "system",
+            content:
+              `The caller is correcting the appointment time. Keep service="${pendingBooking.service}", stylist="${pendingBooking.stylist}", name="${pendingBooking.name}", phone="${pendingBooking.phone}". ` +
+              `Update ONLY datetime based on the caller's correction and output ACTION_JSON book with updated datetime.`,
+          });
+          pendingBookings.delete(callSid);
         }
 
         // ---- OpenAI ----
@@ -455,16 +486,8 @@ If no year is specified, assume the next upcoming future date.
         console.log("AI RAW REPLY:", reply);
         console.log("PARSED ACTION:", action);
 
-        // Strip ACTION_JSON for spoken text
-        let spoken = reply.replace(/ACTION_JSON:[\s\S]*$/, "").trim() || "Got it.";
-
-        // If model tries to book without full payload, keep convo going
-        if (action?.action === "book" && !isCompleteBooking(action)) {
-          spoken = "Quick check—what’s the best phone number to confirm the booking?";
-        }
-
-        // Transfer
-        if (action?.action === "transfer" && process.env.SALON_PHONE) {
+        // Transfer: ONLY if caller actually asked for a human (prevents random transfers)
+        if (action?.action === "transfer" && process.env.SALON_PHONE && wantsHuman(userSpeech)) {
           const transferLine = "Okay, I’ll connect you to the salon now.";
           const audio = await ttsWithRetry(transferLine);
           const id = uuidv4();
@@ -481,10 +504,19 @@ If no year is specified, assume the next upcoming future date.
           return;
         }
 
-        // ✅ Booking complete -> store + ask for confirmation (DO NOT book yet)
+        // Spoken text (strip ACTION_JSON if present) + server-sanitize any ISO leaks
+        let spoken = reply.replace(/ACTION_JSON:[\s\S]*$/, "").trim() || "Got it.";
+        spoken = sanitizeSpoken(spoken);
+
+        // If model tries to book without full payload, keep convo going
+        if (action?.action === "book" && !isCompleteBooking(action)) {
+          spoken = "Quick check — what’s the best phone number to confirm the booking?";
+        }
+
+        // Booking complete -> store + ask for confirmation (server controls the confirmation message)
         if (isCompleteBooking(action)) {
           action.phone = normalizePhone(action.phone) || action.phone;
-          action._createdAt = Date.now(); // internal TTL
+          action._createdAt = Date.now();
 
           pendingBookings.set(callSid, action);
 
@@ -503,7 +535,7 @@ If no year is specified, assume the next upcoming future date.
           return;
         }
 
-        // Normal turn
+        // Normal conversational turn
         const audio = await ttsWithRetry(spoken);
         const id = uuidv4();
         audioStore.set(id, audio);
@@ -530,9 +562,6 @@ If no year is specified, assume the next upcoming future date.
     const pollUrl = `${host}/voice/turn/result?token=${encodeURIComponent(token)}`;
 
     if (fillerId) {
-      const entry = pendingTurns.get(token);
-      if (entry) entry.fillerPlayed = true;
-
       return res.type("text/xml").send(
 `<Response>
   <Play>${host}/audio/${fillerId}.mp3</Play>
@@ -559,7 +588,7 @@ If no year is specified, assume the next upcoming future date.
 });
 
 /**
- * Poll endpoint: if not ready, DO NOT play filler again.
+ * Poll endpoint: if not ready, DO NOT replay filler.
  * Just pause + redirect until the final TwiML is ready.
  */
 app.get("/voice/turn/result", async (req, res) => {
