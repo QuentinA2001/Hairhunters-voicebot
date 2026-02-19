@@ -347,14 +347,30 @@ function normalizePhone(s) {
   return digits;
 }
 
+function cleanSpeech(text) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/[^\w\s]/g, " ")   // remove punctuation (yes. -> yes)
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function isYes(text) {
-  const t = String(text || "").trim().toLowerCase();
-  return /^(yes|yeah|yep|correct|that works|sounds good|ok|okay|sure|confirm|yup)$/i.test(t);
+  const t = cleanSpeech(text);
+
+  // If they said "no" anywhere, don't treat as yes
+  if (/\b(no|nope|nah|negative|not|dont|do not)\b/.test(t)) return false;
+
+  return /\b(yes|yeah|yep|yup|correct|confirm|confirmed|sure|okay|ok|sounds good|that works)\b/.test(t);
 }
 
 function isNo(text) {
-  const t = String(text || "").trim().toLowerCase();
-  return /^(no|nope|nah|negative|not really|incorrect)$/i.test(t);
+  const t = cleanSpeech(text);
+
+  // If clearly yes, don't treat as no
+  if (/\b(yes|yeah|yep|yup|correct|confirm|sure|okay|ok)\b/.test(t)) return false;
+
+  return /\b(no|nope|nah|negative|incorrect|not right|cancel)\b/.test(t);
 }
 
 function wantsHuman(text) {
