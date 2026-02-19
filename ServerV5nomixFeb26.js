@@ -481,7 +481,6 @@ app.post("/voice/incoming", async (req, res) => {
 
     return res.type("text/xml").send(
 `<Response>
-  <Play loop="0">${ambientUrl(req)}</Play>
   <Play>${host}/audio/${id}.mp3</Play>
   <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
 </Response>`
