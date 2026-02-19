@@ -21,7 +21,7 @@ const BASE_URL = process.env.BASE_URL || "";
 const audioStore = new Map();            // id -> Buffer(mp3)
 const conversationStore = new Map();     // callSid -> messages[]
 const pendingTurns = new Map();          // token -> { ready, twiml, createdAt, fillerId, fillerPlayed }
-const pendingBookings = new Map();       // callSid -> action booking payload waiting for "yes"
+const pendingBookings = new Map();       // callSid -> booking payload waiting for "yes"
 
 // Keep-alive HTTP client (reduces latency)
 const httpsAgent = new https.Agent({ keepAlive: true });
@@ -32,7 +32,7 @@ const pick = (v) => (v ? String(v).slice(0, 6) + "…" : "missing");
 
 // ---------- FILLERS (pre-generated ElevenLabs clips) ----------
 const fillerText = ["One sec.", "Got it.", "Okay.", "Alright."];
-const fillerIds = []; // array of mp3 ids ready to use
+const fillerIds = []; // mp3 ids ready to use
 
 const clipIds = {
   repeat: null, // "Sorry—could you say that again?"
@@ -218,7 +218,27 @@ function isYes(text) {
 
 function isNo(text) {
   const t = String(text || "").trim().toLowerCase();
-  return /^(no|nope|not really|nah|negative)$/i.test(t);
+  return /^(no|nope|nah|negative|not really)$/i.test(t);
+}
+
+/**
+ * ✅ Post booking to Zapier and REQUIRE success.
+ * If Zapier fails, we do NOT hang up — we keep the caller in the loop.
+ */
+async function postBookingToZapier(payload) {
+  const url = process.env.BOOKING_WEBHOOK_URL;
+  if (!url) throw new Error("BOOKING_WEBHOOK_URL missing");
+
+  const resp = await http.post(url, payload, {
+    timeout: 5000,
+    validateStatus: () => true, // don't throw on 4xx/5xx
+    headers: { "Content-Type": "application/json" },
+  });
+
+  console.log("📨 Zapier POST result:", { status: resp.status });
+  if (resp.status < 200 || resp.status >= 300) {
+    throw new Error(`Zapier returned ${resp.status}`);
+  }
 }
 
 // Cleanup so memory doesn't grow forever
@@ -233,6 +253,11 @@ setInterval(() => {
   const now = Date.now();
   for (const [token, v] of pendingTurns.entries()) {
     if (now - v.createdAt > 120_000) pendingTurns.delete(token);
+  }
+
+  // pendingBookings: expire after 10 minutes (in case call drops)
+  for (const [sid, v] of pendingBookings.entries()) {
+    if (now - (v._createdAt || now) > 600_000) pendingBookings.delete(sid);
   }
 }, 30_000);
 
@@ -335,7 +360,7 @@ If no year is specified, assume the next upcoming future date.
       twiml: "",
       createdAt: Date.now(),
       fillerId,
-      fillerPlayed: false
+      fillerPlayed: false,
     });
 
     // Background work (don’t await)
@@ -344,35 +369,48 @@ If no year is specified, assume the next upcoming future date.
       if (!entry) return;
 
       try {
-        // ✅ CONFIRMATION HANDLER (server-side)
-        // If we already asked "confirm?", and user says YES, finalize booking now.
+        // ✅ SERVER-SIDE CONFIRMATION HANDLER
         const pendingBooking = pendingBookings.get(callSid);
+
         if (pendingBooking && isYes(userSpeech)) {
-          if (!process.env.BOOKING_WEBHOOK_URL) {
-            console.log("⚠️ BOOKING_WEBHOOK_URL missing; cannot post to Zapier");
-          } else {
-            http.post(process.env.BOOKING_WEBHOOK_URL, pendingBooking).catch(() => {});
-          }
-
           const pretty = formatTorontoConfirm(pendingBooking.datetime) || pendingBooking.datetime;
-          const finalLine = `Perfect ${pendingBooking.name}. You’re all set for ${pretty}.`;
 
-          const audio = await ttsWithRetry(finalLine);
-          const id = uuidv4();
-          audioStore.set(id, audio);
+          try {
+            console.log("✅ Confirmed booking, posting to Zapier:", pendingBooking);
+            await postBookingToZapier(pendingBooking);
 
-          entry.ready = true;
-          entry.twiml = `<Response>
+            const finalLine = `Perfect ${pendingBooking.name}. You’re all set for ${pretty}.`;
+            const audio = await ttsWithRetry(finalLine);
+            const id = uuidv4();
+            audioStore.set(id, audio);
+
+            entry.ready = true;
+            entry.twiml = `<Response>
   <Play>${host}/audio/${id}.mp3</Play>
   <Hangup/>
 </Response>`;
 
-          pendingBookings.delete(callSid);
-          conversationStore.delete(callSid);
-          return;
+            pendingBookings.delete(callSid);
+            conversationStore.delete(callSid);
+            return;
+          } catch (err) {
+            console.log("❌ Booking post failed, NOT hanging up:", err?.message || err);
+
+            const failLine =
+              "Sorry — I couldn’t save that appointment right now. Do you want to try a different time, or should I connect you to the salon?";
+            const audio = await ttsWithRetry(failLine);
+            const id = uuidv4();
+            audioStore.set(id, audio);
+
+            entry.ready = true;
+            entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+</Response>`;
+            return;
+          }
         }
 
-        // If they say NO, clear the pending booking and ask what to change.
         if (pendingBooking && isNo(userSpeech)) {
           pendingBookings.delete(callSid);
 
@@ -443,9 +481,10 @@ If no year is specified, assume the next upcoming future date.
           return;
         }
 
-        // ✅ Booking complete -> DO NOT book yet. Ask for confirmation and store it.
+        // ✅ Booking complete -> store + ask for confirmation (DO NOT book yet)
         if (isCompleteBooking(action)) {
           action.phone = normalizePhone(action.phone) || action.phone;
+          action._createdAt = Date.now(); // internal TTL
 
           pendingBookings.set(callSid, action);
 
@@ -510,15 +549,6 @@ If no year is specified, assume the next upcoming future date.
     );
   } catch (e) {
     console.log("❌ /voice/turn UNCAUGHT", e?.stack || e?.message || e);
-    const repeatId = clipIds.repeat;
-    if (repeatId) {
-      return res.type("text/xml").send(
-`<Response>
-  <Play>${getHost(req)}/audio/${repeatId}.mp3</Play>
-  <Gather input="speech" action="${getHost(req)}/voice/turn" method="POST" speechTimeout="auto" />
-</Response>`
-      );
-    }
     return res.type("text/xml").send(
 `<Response>
   <Say>Sorry—could you say that again?</Say>
@@ -566,15 +596,6 @@ app.get("/voice/turn/result", async (req, res) => {
     );
   } catch (e) {
     console.log("❌ /voice/turn/result error", e?.stack || e?.message || e);
-    const repeatId = clipIds.repeat;
-    if (repeatId) {
-      return res.type("text/xml").send(
-`<Response>
-  <Play>${host}/audio/${repeatId}.mp3</Play>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
-</Response>`
-      );
-    }
     return res.type("text/xml").send(
 `<Response>
   <Say>Sorry—could you say that again?</Say>
@@ -597,6 +618,13 @@ app.get("/audio/:id.mp3", (req, res) => {
 
 // --- diagnostic routes ---
 app.get("/env-check", (_, res) => {
+  let zapHost = "missing";
+  try {
+    zapHost = process.env.BOOKING_WEBHOOK_URL ? new URL(process.env.BOOKING_WEBHOOK_URL).host : "missing";
+  } catch {
+    zapHost = "invalid";
+  }
+
   res.json({
     BASE_URL: process.env.BASE_URL || "missing",
     SALON_NAME: process.env.SALON_NAME || "missing",
@@ -604,6 +632,7 @@ app.get("/env-check", (_, res) => {
     ELEVEN_VOICE_ID: process.env.ELEVEN_VOICE_ID || "missing",
     OPENAI_API_KEY_len: process.env.OPENAI_API_KEY?.length || 0,
     BOOKING_WEBHOOK_URL: process.env.BOOKING_WEBHOOK_URL ? "set" : "missing",
+    BOOKING_WEBHOOK_URL_host: zapHost,
     SALON_PHONE: process.env.SALON_PHONE || "missing",
     fillerCount: fillerIds.length,
     repeatClip: clipIds.repeat ? "ready" : "missing",
