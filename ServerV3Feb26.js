@@ -1,9 +1,15 @@
+import fs from "fs";
+import path from "path";
+import ffmpeg from "fluent-ffmpeg";
+import ffmpegPath from "ffmpeg-static";
 import express from "express";
 import bodyParser from "body-parser";
 import axios from "axios";
 import https from "https";
 import { v4 as uuidv4 } from "uuid";
 import "dotenv/config";
+
+ffmpeg.setFfmpegPath(ffmpegPath);
 
 const app = express();
 
@@ -174,6 +180,59 @@ function getTZParts(date, timeZone = "America/Toronto") {
     mm: Number(map.minute),
     ss: Number(map.second),
   };
+}
+function mixSpeechWithAmbient(speechBuf, opts = {}) {
+  const {
+    ambientFile = path.join(process.cwd(), "assets", "shopping-mall.mp3"),
+    ambientVolume = 0.18, // tweak: 0.10–0.25 usually
+  } = opts;
+
+  return new Promise((resolve, reject) => {
+    const tmpIn = path.join("/tmp", `speech-${uuidv4()}.mp3`);
+    const tmpOut = path.join("/tmp", `mixed-${uuidv4()}.mp3`);
+
+    try {
+      fs.writeFileSync(tmpIn, speechBuf);
+    } catch (e) {
+      return reject(e);
+    }
+
+    // -stream_loop -1 loops ambient indefinitely
+    // amix mixes them; duration=first makes output same length as speech
+    ffmpeg()
+      .input(tmpIn)
+      .inputOptions(["-re"])
+      .input(ambientFile)
+      .inputOptions(["-stream_loop", "-1"])
+      .complexFilter([
+        `[1:a]volume=${ambientVolume}[amb]`,
+        `[0:a][amb]amix=inputs=2:duration=first:dropout_transition=0,aresample=async=1[m]`,
+      ])
+      .outputOptions([
+        "-map", "[m]",
+        "-c:a", "libmp3lame",
+        "-b:a", "128k",
+        "-ar", "44100",
+      ])
+      .on("end", () => {
+        try {
+          const out = fs.readFileSync(tmpOut);
+          // cleanup
+          fs.unlinkSync(tmpIn);
+          fs.unlinkSync(tmpOut);
+          resolve(out);
+        } catch (e) {
+          reject(e);
+        }
+      })
+      .on("error", (err) => {
+        // cleanup best-effort
+        try { if (fs.existsSync(tmpIn)) fs.unlinkSync(tmpIn); } catch {}
+        try { if (fs.existsSync(tmpOut)) fs.unlinkSync(tmpOut); } catch {}
+        reject(err);
+      })
+      .save(tmpOut);
+  });
 }
 
 // Convert a desired Toronto wall-time (yyyy-mm-dd hh:mm:ss) into a real JS Date instant
