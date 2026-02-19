@@ -11,6 +11,7 @@ const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
+app.use("/assets", express.static("assets"));
 /**
  * Set BASE_URL in Render env vars to your public URL, e.g.
  * https://hairhunters-voicebot.onrender.com
