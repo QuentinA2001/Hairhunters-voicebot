@@ -173,8 +173,21 @@ app.post("/voice/turn", async (req, res) => {
 
   // Init memory for this call
   if (!conversationStore.has(callSid)) {
-    conversationStore.set(callSid, [{ role: "system", content: SYSTEM_PROMPT }]);
-  }
+  const now = new Date().toISOString();
+
+  conversationStore.set(callSid, [
+    { 
+      role: "system", 
+      content: SYSTEM_PROMPT + `
+
+CURRENT_DATETIME: ${now}
+Timezone: America/Toronto
+Never book in the past.
+If no year is specified, assume the next upcoming future date.
+`
+    }
+  ]);
+}
   const messages = conversationStore.get(callSid);
   messages.push({ role: "user", content: userSpeech });
 
