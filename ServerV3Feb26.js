@@ -726,13 +726,13 @@ if (resolvedISO) {
     const pollUrl = `${host}/voice/turn/result?token=${encodeURIComponent(token)}`;
 
     if (fillerId) {
-      return res.type("text/xml").send(
+  return res.type("text/xml").send(
 `<Response>
   <Play>${host}/audio/${fillerId}.mp3</Play>
   <Redirect method="GET">${pollUrl}</Redirect>
 </Response>`
-      );
-    }
+  );
+}
 
     return res.type("text/xml").send(
 `<Response>
