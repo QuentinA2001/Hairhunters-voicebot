@@ -299,6 +299,11 @@ function getHost(req) {
   return BASE_URL || `https://${req.headers.host}`;
 }
 
+function ambientUrl(req) {
+  const host = getHost(req);
+  return `${host}/assets/shopping-mall.mp3`;
+}
+
 function formatTorontoConfirm(iso) {
   const d = new Date(iso);
   if (isNaN(d.getTime())) return null;
@@ -476,10 +481,11 @@ app.post("/voice/incoming", async (req, res) => {
 
     return res.type("text/xml").send(
 `<Response>
+  <Play loop="0">${ambientUrl(req)}</Play>
   <Play>${host}/audio/${id}.mp3</Play>
   <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
 </Response>`
-    );
+);
   } catch {
     return res.type("text/xml").send(
 `<Response>
