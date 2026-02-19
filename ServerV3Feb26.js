@@ -149,6 +149,141 @@ async function warmFillers() {
 }
 
 // ---------- HELPERS ----------
+// 🔥 ONLY NEW ADDITION (DATE RESOLVER)
+function getTZParts(date, timeZone = "America/Toronto") {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(date);
+
+  const map = {};
+  for (const p of parts) if (p.type !== "literal") map[p.type] = p.value;
+
+  return {
+    y: Number(map.year),
+    m: Number(map.month),
+    d: Number(map.day),
+    hh: Number(map.hour),
+    mm: Number(map.minute),
+    ss: Number(map.second),
+  };
+}
+
+// Convert a desired Toronto wall-time (yyyy-mm-dd hh:mm:ss) into a real JS Date instant
+function zonedWallTimeToInstant({ y, m, d, hh, mm, ss }, timeZone = "America/Toronto") {
+  const desiredUTC = Date.UTC(y, m - 1, d, hh, mm, ss);
+
+  // Start guess treating wall-time as UTC, then iteratively correct until tz wall-time matches
+  let guess = new Date(desiredUTC);
+  for (let i = 0; i < 3; i++) {
+    const got = getTZParts(guess, timeZone);
+    const gotUTC = Date.UTC(got.y, got.m - 1, got.d, got.hh, got.mm, got.ss);
+    guess = new Date(guess.getTime() + (desiredUTC - gotUTC));
+  }
+  return guess;
+}
+
+// Format a Date instant as ISO *with Toronto offset* (e.g., ...-05:00 or ...-04:00)
+function formatISOWithTZOffset(date, timeZone = "America/Toronto") {
+  const p = getTZParts(date, timeZone);
+  const isoLocal = `${String(p.y).padStart(4, "0")}-${String(p.m).padStart(2, "0")}-${String(p.d).padStart(2, "0")}T${String(p.hh).padStart(2, "0")}:${String(p.mm).padStart(2, "0")}:${String(p.ss).padStart(2, "0")}`;
+
+  // Compute offset minutes: compare "same wall-time as UTC" vs actual instant
+  const asUTC = new Date(Date.UTC(p.y, p.m - 1, p.d, p.hh, p.mm, p.ss));
+  const offsetMin = Math.round((date.getTime() - asUTC.getTime()) / 60000); // Toronto winter => -300
+
+  const sign = offsetMin <= 0 ? "-" : "+";
+  const abs = Math.abs(offsetMin);
+  const oh = String(Math.floor(abs / 60)).padStart(2, "0");
+  const om = String(abs % 60).padStart(2, "0");
+
+  return `${isoLocal}${sign}${oh}:${om}`;
+}
+
+// ✅ REPLACE your existing resolveDateToISO with this:
+function getWeekdayIndexInTZ(date, timeZone = "America/Toronto") {
+  const wd = new Intl.DateTimeFormat("en-CA", { timeZone, weekday: "long" }).format(date).toLowerCase();
+  const days = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"];
+  return days.indexOf(wd);
+}
+
+function resolveDateToISO(text) {
+  const tz = "America/Toronto";
+  const lower = String(text || "").toLowerCase();
+
+  // Day keywords
+  const days = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"];
+
+  // Toronto "today"
+  const now = new Date();
+  const nowT = getTZParts(now, tz);
+  // Create a Date that represents Toronto "now" (as an instant) using the wall-time parts
+  const nowInstant = zonedWallTimeToInstant({ ...nowT }, tz);
+  const todayIdx = getWeekdayIndexInTZ(nowInstant, tz);
+
+  // Determine target day
+  let targetIdx = -1;
+  for (let i = 0; i < days.length; i++) {
+    if (lower.includes(days[i])) { targetIdx = i; break; }
+  }
+
+  // If no weekday mentioned, don't resolve
+  if (targetIdx === -1) return null;
+
+  let diff = targetIdx - todayIdx;
+  if (diff <= 0) diff += 7;
+  if (/\bnext\b/.test(lower)) diff += 7; // "next Tuesday" -> week after
+
+  // Parse time
+  let hh = 12, mm = 0, ss = 0;
+
+  if (/\bnoon\b/.test(lower)) {
+    hh = 12; mm = 0;
+  } else if (/\bmidnight\b/.test(lower)) {
+    hh = 0; mm = 0;
+  } else {
+    // Supports: "4", "4pm", "4 pm", "4:30", "4:30pm"
+    const m = lower.match(/(?:\bat\b\s*)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b|(?:\bat\b\s*)(\d{1,2})(?::(\d{2}))?\b/);
+    if (m) {
+  const hourStr = m[1] || m[4];
+  const minStr  = m[2] || m[5] || "0";
+  const ampm    = m[3]; // only present in first alternative
+
+  hh = parseInt(hourStr, 10);
+  mm = parseInt(minStr, 10);
+
+  if (ampm) {
+    if (ampm === "pm" && hh !== 12) hh += 12;
+    if (ampm === "am" && hh === 12) hh = 0;
+  } else {
+    // only allowed when they said "at 4" (second alternative)
+    if (hh >= 1 && hh <= 7) hh += 12;
+    if (hh === 12) hh = 12;
+  }
+} else {
+  return null;
+}
+  }
+
+  // Build target Toronto wall-time by adding diff days to Toronto "today"
+  const targetBase = new Date(nowInstant.getTime() + diff * 24 * 60 * 60 * 1000);
+  const baseParts = getTZParts(targetBase, tz);
+
+  const targetInstant = zonedWallTimeToInstant(
+    { y: baseParts.y, m: baseParts.m, d: baseParts.d, hh, mm, ss },
+    tz
+  );
+
+  // Output ISO with Toronto offset (NOT Z)
+  return formatISOWithTZOffset(targetInstant, tz);
+}
+
 function extractAction(text) {
   const m = text?.match(/ACTION_JSON:\s*(\{.*\})/s);
   if (!m) return null;
@@ -369,7 +504,19 @@ If no year is specified, assume the next upcoming future date.
     }
 
     const messages = conversationStore.get(callSid);
-    messages.push({ role: "user", content: userSpeech });
+const resolvedISO = resolveDateToISO(userSpeech);
+
+if (resolvedISO) {
+  messages.push({
+    role: "user",
+    content: `${userSpeech} (resolved datetime: ${resolvedISO})`
+  });
+} else {
+  messages.push({
+    role: "user",
+    content: userSpeech
+  });
+}
 
     // Create pending token for this turn
     const token = uuidv4();
