@@ -375,21 +375,6 @@ async function postBookingToZapier(payload) {
   if (resp.status < 200 || resp.status >= 300) throw new Error(`Zapier returned ${resp.status}`);
 }
 
-function digitsOnly(s) {
-  return String(s || "").replace(/\D/g, "");
-}
-
-function speakDigits(digits) {
-  return String(digits).split("").join(" ");
-}
-
-function extractLikelyPhoneFromSpeech(s) {
-  // Handles both digits and cases where Twilio returns "905 555 8851"
-  const d = digitsOnly(s);
-  if (d.length === 11 && d.startsWith("1")) return d.slice(1);
-  if (d.length >= 10) return d.slice(-10);
-  return "";
-}
 
 // Cleanup so memory doesn't grow forever
 setInterval(() => {
@@ -407,6 +392,72 @@ setInterval(() => {
     if (now - (v._createdAt || now) > 600_000) pendingBookings.delete(sid);
   }
 }, 30_000);
+
+// ---- BOOKING DRAFT + PHONE CONFIRM STATE ----
+const bookingDraftStore = new Map();      // callSid -> { name, phone, service, stylist, datetime }
+const awaitingPhoneConfirm = new Map();   // callSid -> "9055558851" waiting for yes/no
+
+function speakDigits(digits) {
+  return String(digits).split("").join(" ");
+}
+
+/**
+ * Converts speech like:
+ * "905 555 8851"
+ * "nine oh five five five five eight eight five one"
+ * "nine zero five..."
+ * into a 10-digit string (best effort)
+ */
+function extractLikelyPhoneFromSpeech(speech) {
+  const raw = String(speech || "").toLowerCase();
+
+  // normalize common "oh"/"o" to zero
+  let t = raw
+    .replace(/\boh\b/g, " zero ")
+    .replace(/\bo\b/g, " zero ")
+    .replace(/-/g, " ")
+    .replace(/\./g, " ")
+    .replace(/,/g, " ");
+
+  // word -> digit mapping
+  const map = {
+    zero: "0", one: "1", two: "2", three: "3", four: "4",
+    five: "5", six: "6", seven: "7", eight: "8", nine: "9",
+  };
+
+  // turn words into digits
+  t = t.split(/\s+/).map(w => (map[w] ?? w)).join(" ");
+
+  // keep only digits
+  const digits = t.replace(/\D/g, "");
+
+  // prefer a clean 10-digit number if present anywhere
+  if (digits.length === 10) return digits;
+
+  // if longer, take last 10 (handles “+1 905...” etc)
+  if (digits.length > 10) return digits.slice(-10);
+
+  // if shorter, return as-is (caller may be mid-number)
+  return digits;
+}
+
+function getDraft(callSid) {
+  return bookingDraftStore.get(callSid) || {};
+}
+
+function setDraft(callSid, patch) {
+  bookingDraftStore.set(callSid, { ...getDraft(callSid), ...patch });
+}
+
+function draftSummarySystem(draft) {
+  const parts = [];
+  if (draft.name) parts.push(`name="${draft.name}"`);
+  if (draft.phone) parts.push(`phone="${draft.phone}"`);
+  if (draft.service) parts.push(`service="${draft.service}"`);
+  if (draft.stylist) parts.push(`stylist="${draft.stylist}"`);
+  if (draft.datetime) parts.push(`datetime="${draft.datetime}"`);
+  return parts.length ? `Known booking fields so far: ${parts.join(", ")}.` : `No booking fields collected yet.`;
+}
 
 // ---------- ROUTES ----------
 app.get("/voice/incoming", async (req, res) => {
@@ -484,32 +535,6 @@ If no year is specified, assume the next upcoming future date.
     }
 
     const messages = conversationStore.get(callSid);
-
-const maybePhone = extractLikelyPhoneFromSpeech(userSpeech);
-
-// If they just said a phone number, handle it immediately
-if (maybePhone.length === 10) {
-
-  // store it properly in conversation
-  messages.push({
-    role: "user",
-    content: `My phone number is ${maybePhone}`
-  });
-
-  // 🔥 FORCE correct confirmation (don’t let AI freestyle this)
-  const spoken = `Perfect — I got ${maybePhone.split("").join(" ")}. What service would you like to book?`;
-
-  const audio = await ttsWithRetry(spoken);
-  const id = uuidv4();
-  audioStore.set(id, audio);
-
-  return res.type("text/xml").send(
-`<Response>
-  <Play>${getHost(req)}/audio/${id}.mp3</Play>
-  <Gather input="speech" action="${getHost(req)}/voice/turn" method="POST" speechTimeout="auto" />
-</Response>`
-  );
-}
     
     const resolvedISO = resolveDateToISO(userSpeech);
 
@@ -604,6 +629,89 @@ if (maybePhone.length === 10) {
           pendingBookings.delete(callSid);
         }
 
+        // ---- PHONE CONFIRM FLOW (server-controlled) ----
+const maybePhone = extractLikelyPhoneFromSpeech(userSpeech);
+
+// A) If we are waiting on "yes/no" to confirm phone
+if (awaitingPhoneConfirm.has(callSid)) {
+  const pendingPhone = awaitingPhoneConfirm.get(callSid);
+
+  if (isYes(userSpeech)) {
+    // lock phone into draft
+    setDraft(callSid, { phone: pendingPhone });
+    messages.push({
+  role: "system",
+  content: `Caller phone confirmed: ${pendingPhone}. Do NOT ask for phone again.`,
+});
+    awaitingPhoneConfirm.delete(callSid);
+
+    const line = `Perfect — I’ve got ${speakDigits(pendingPhone)}. What service would you like to book?`;
+    const audio = await ttsWithRetry(line);
+    const id = uuidv4();
+    audioStore.set(id, audio);
+
+    entry.ready = true;
+    entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+</Response>`;
+    return;
+  }
+
+  if (isNo(userSpeech)) {
+    awaitingPhoneConfirm.delete(callSid);
+
+    const line = "No worries — can you say the full 10-digit phone number again, one digit at a time?";
+    const audio = await ttsWithRetry(line);
+    const id = uuidv4();
+    audioStore.set(id, audio);
+
+    entry.ready = true;
+    entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+</Response>`;
+    return;
+  }
+
+  // unclear response: ask again
+  const line = `Just to confirm — is your number ${speakDigits(pendingPhone)}?`;
+  const audio = await ttsWithRetry(line);
+  const id = uuidv4();
+  audioStore.set(id, audio);
+
+  entry.ready = true;
+  entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+</Response>`;
+  return;
+}
+
+// B) If caller just said a full phone number this turn -> ask for confirmation
+if (maybePhone.length === 10) {
+  awaitingPhoneConfirm.set(callSid, maybePhone);
+
+  const line = `Just to confirm — is your number ${speakDigits(maybePhone)}?`;
+  const audio = await ttsWithRetry(line);
+  const id = uuidv4();
+  audioStore.set(id, audio);
+
+  entry.ready = true;
+  entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+</Response>`;
+  return;
+}
+
+// Remind the model what we already collected (prevents re-asking)
+const draft = getDraft(callSid);
+messages.push({
+  role: "system",
+  content: `${draftSummarySystem(draft)} Do NOT ask for fields already known. Ask ONLY for the next missing field.`,
+});
+        
         let reply = "Sorry—could you say that again?";
 
         try {
@@ -631,6 +739,7 @@ if (maybePhone.length === 10) {
         console.log("AI RAW REPLY:", reply);
         console.log("PARSED ACTION:", action);
 
+      
         if (action?.action === "transfer" && process.env.SALON_PHONE && wantsHuman(userSpeech)) {
           const transferLine = "Okay, I’ll connect you to the salon now.";
           const audio = await ttsWithRetry(transferLine);
