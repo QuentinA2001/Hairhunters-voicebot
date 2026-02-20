@@ -18,6 +18,7 @@ app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
 app.use("/assets", express.static("assets"));
+
 /**
  * Set BASE_URL in Render env vars to your public URL, e.g.
  * https://hairhunters-voicebot.onrender.com
@@ -29,6 +30,7 @@ const audioStore = new Map();            // id -> Buffer(mp3)
 const conversationStore = new Map();     // callSid -> messages[]
 const pendingTurns = new Map();          // token -> { ready, twiml, createdAt, fillerId }
 const pendingBookings = new Map();       // callSid -> booking payload waiting for confirm
+const bookingDrafts = new Map();         // callSid -> { service, stylist, datetime, name, phone }  ✅ NEW
 
 // Keep-alive HTTP client (reduces latency)
 const httpsAgent = new https.Agent({ keepAlive: true });
@@ -54,24 +56,15 @@ function pickFillerId() {
 const SYSTEM_PROMPT = `
 Your name is Alex. You are a warm, confident, mature, phone receptionist for ${process.env.SALON_NAME || "the salon"} in ${process.env.SALON_CITY || "the city"}.
 
-Tasks:
-- Handle bookings/reschedules. Collect: name, phone (Confirm the phone number after they say it), service (haircut/colour/cut & colour), stylist (Cosmo, Vince, Cassidy), and day/time window.
+Rules:
+- Keep replies SHORT (1–2 sentences). Ask ONE question at a time.
 - Do NOT ask for email.
 - Assume timezone America/Toronto unless otherwise specified.
-- Convert natural language like "Tuesday at 4" into ISO 8601 with timezone offset.
-- datetime MUST be ISO format like: 2026-02-21T15:00:00-05:00
-- Do NOT state the weekday (Monday/Tuesday/etc) unless the caller already said it. (The server will confirm weekday.)
-- Keep replies SHORT (1–2 sentences). Ask ONE question at a time.
-- When you say the time back to the caller to confirm, speak in natural language (NOT ISO).
-- Phone MUST be digits only (no spaces, no dashes, no words). Example: “9055551234”.
-- If the caller says “nine oh five…”, convert to digits.
-
-- If caller asks for a human/manager/desk, respond with:
+- Do NOT state the weekday unless the caller already said it. (Server confirms weekday.)
+- If caller asks for a human/manager/desk, respond with ONLY:
 ACTION_JSON: {"action":"transfer"}
-(When outputting ACTION_JSON, output ONLY that line.)
 
-- When you have all booking fields, respond with ONLY:
-ACTION_JSON: {"action":"book","service":"...","stylist":"...","datetime":"ISO_FORMAT","name":"...","phone":"..."}
+(When outputting ACTION_JSON, output ONLY that line.)
 `;
 
 // ---------- ELEVENLABS TTS ----------
@@ -136,9 +129,9 @@ async function ttsWithRetry(text, tries = 2) {
 async function ensureClip(kind, text) {
   if (clipIds[kind]) return clipIds[kind];
   let audio = await ttsWithRetry(text);
-audio = await mixSpeechWithAmbient(audio);
-const id = uuidv4();
-audioStore.set(id, audio);
+  audio = await mixSpeechWithAmbient(audio);
+  const id = uuidv4();
+  audioStore.set(id, audio);
   clipIds[kind] = id;
   return id;
 }
@@ -147,10 +140,10 @@ async function warmFillers() {
   try {
     for (const line of fillerText) {
       let audio = await ttsWithRetry(line);
-audio = await mixSpeechWithAmbient(audio);   // ✅ add this
-const id = uuidv4();
-audioStore.set(id, audio);
-fillerIds.push(id);
+      audio = await mixSpeechWithAmbient(audio);
+      const id = uuidv4();
+      audioStore.set(id, audio);
+      fillerIds.push(id);
     }
     await ensureClip("repeat", "Sorry—could you say that again?");
     console.log(`✅ Warmed fillers: ${fillerIds.length} | repeat clip ready`);
@@ -160,7 +153,6 @@ fillerIds.push(id);
 }
 
 // ---------- HELPERS ----------
-// 🔥 ONLY NEW ADDITION (DATE RESOLVER)
 function getTZParts(date, timeZone = "America/Toronto") {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone,
@@ -185,10 +177,11 @@ function getTZParts(date, timeZone = "America/Toronto") {
     ss: Number(map.second),
   };
 }
+
 function mixSpeechWithAmbient(speechBuf, opts = {}) {
   const {
     ambientFile = path.join(process.cwd(), "assets", "shopping-mall.mp3"),
-    ambientVolume = 0.18, // tweak: 0.10–0.25 usually
+    ambientVolume = 0.18,
   } = opts;
 
   return new Promise((resolve, reject) => {
@@ -201,8 +194,6 @@ function mixSpeechWithAmbient(speechBuf, opts = {}) {
       return reject(e);
     }
 
-    // -stream_loop -1 loops ambient indefinitely
-    // amix mixes them; duration=first makes output same length as speech
     ffmpeg()
       .input(tmpIn)
       .inputOptions(["-re"])
@@ -221,7 +212,6 @@ function mixSpeechWithAmbient(speechBuf, opts = {}) {
       .on("end", () => {
         try {
           const out = fs.readFileSync(tmpOut);
-          // cleanup
           fs.unlinkSync(tmpIn);
           fs.unlinkSync(tmpOut);
           resolve(out);
@@ -230,7 +220,6 @@ function mixSpeechWithAmbient(speechBuf, opts = {}) {
         }
       })
       .on("error", (err) => {
-        // cleanup best-effort
         try { if (fs.existsSync(tmpIn)) fs.unlinkSync(tmpIn); } catch {}
         try { if (fs.existsSync(tmpOut)) fs.unlinkSync(tmpOut); } catch {}
         reject(err);
@@ -239,11 +228,8 @@ function mixSpeechWithAmbient(speechBuf, opts = {}) {
   });
 }
 
-// Convert a desired Toronto wall-time (yyyy-mm-dd hh:mm:ss) into a real JS Date instant
 function zonedWallTimeToInstant({ y, m, d, hh, mm, ss }, timeZone = "America/Toronto") {
   const desiredUTC = Date.UTC(y, m - 1, d, hh, mm, ss);
-
-  // Start guess treating wall-time as UTC, then iteratively correct until tz wall-time matches
   let guess = new Date(desiredUTC);
   for (let i = 0; i < 3; i++) {
     const got = getTZParts(guess, timeZone);
@@ -253,14 +239,12 @@ function zonedWallTimeToInstant({ y, m, d, hh, mm, ss }, timeZone = "America/Tor
   return guess;
 }
 
-// Format a Date instant as ISO *with Toronto offset* (e.g., ...-05:00 or ...-04:00)
 function formatISOWithTZOffset(date, timeZone = "America/Toronto") {
   const p = getTZParts(date, timeZone);
   const isoLocal = `${String(p.y).padStart(4, "0")}-${String(p.m).padStart(2, "0")}-${String(p.d).padStart(2, "0")}T${String(p.hh).padStart(2, "0")}:${String(p.mm).padStart(2, "0")}:${String(p.ss).padStart(2, "0")}`;
 
-  // Compute offset minutes: compare "same wall-time as UTC" vs actual instant
   const asUTC = new Date(Date.UTC(p.y, p.m - 1, p.d, p.hh, p.mm, p.ss));
-  const offsetMin = Math.round((date.getTime() - asUTC.getTime()) / 60000); // Toronto winter => -300
+  const offsetMin = Math.round((date.getTime() - asUTC.getTime()) / 60000);
 
   const sign = offsetMin <= 0 ? "-" : "+";
   const abs = Math.abs(offsetMin);
@@ -270,41 +254,35 @@ function formatISOWithTZOffset(date, timeZone = "America/Toronto") {
   return `${isoLocal}${sign}${oh}:${om}`;
 }
 
-// ✅ REPLACE your existing resolveDateToISO with this:
 function getWeekdayIndexInTZ(date, timeZone = "America/Toronto") {
   const wd = new Intl.DateTimeFormat("en-CA", { timeZone, weekday: "long" }).format(date).toLowerCase();
   const days = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"];
   return days.indexOf(wd);
 }
 
+// ✅ date resolver (weekday + next + time)
 function resolveDateToISO(text) {
   const tz = "America/Toronto";
   const lower = String(text || "").toLowerCase();
-
-  // Day keywords
   const days = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"];
 
-  // Toronto "today"
   const now = new Date();
   const nowT = getTZParts(now, tz);
-  // Create a Date that represents Toronto "now" (as an instant) using the wall-time parts
   const nowInstant = zonedWallTimeToInstant({ ...nowT }, tz);
   const todayIdx = getWeekdayIndexInTZ(nowInstant, tz);
 
-  // Determine target day
   let targetIdx = -1;
   for (let i = 0; i < days.length; i++) {
     if (lower.includes(days[i])) { targetIdx = i; break; }
   }
-
-  // If no weekday mentioned, don't resolve
   if (targetIdx === -1) return null;
 
   let diff = targetIdx - todayIdx;
   if (diff <= 0) diff += 7;
-  if (/\bnext\b/.test(lower)) diff += 7; // "next Tuesday" -> week after
 
-  // Parse time
+  // IMPORTANT: "next Wednesday" = week after the upcoming one
+  if (/\bnext\b/.test(lower)) diff += 7;
+
   let hh = 12, mm = 0, ss = 0;
 
   if (/\bnoon\b/.test(lower)) {
@@ -312,30 +290,24 @@ function resolveDateToISO(text) {
   } else if (/\bmidnight\b/.test(lower)) {
     hh = 0; mm = 0;
   } else {
-    // Supports: "4", "4pm", "4 pm", "4:30", "4:30pm"
     const m = lower.match(/(?:\bat\b\s*)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b|(?:\bat\b\s*)(\d{1,2})(?::(\d{2}))?\b/);
-    if (m) {
-  const hourStr = m[1] || m[4];
-  const minStr  = m[2] || m[5] || "0";
-  const ampm    = m[3]; // only present in first alternative
+    if (!m) return null;
 
-  hh = parseInt(hourStr, 10);
-  mm = parseInt(minStr, 10);
+    const hourStr = m[1] || m[4];
+    const minStr  = m[2] || m[5] || "0";
+    const ampm    = m[3];
 
-  if (ampm) {
-    if (ampm === "pm" && hh !== 12) hh += 12;
-    if (ampm === "am" && hh === 12) hh = 0;
-  } else {
-    // only allowed when they said "at 4" (second alternative)
-    if (hh >= 1 && hh <= 7) hh += 12;
-    if (hh === 12) hh = 12;
-  }
-} else {
-  return null;
-}
+    hh = parseInt(hourStr, 10);
+    mm = parseInt(minStr, 10);
+
+    if (ampm) {
+      if (ampm === "pm" && hh !== 12) hh += 12;
+      if (ampm === "am" && hh === 12) hh = 0;
+    } else {
+      if (hh >= 1 && hh <= 7) hh += 12;
+    }
   }
 
-  // Build target Toronto wall-time by adding diff days to Toronto "today"
   const targetBase = new Date(nowInstant.getTime() + diff * 24 * 60 * 60 * 1000);
   const baseParts = getTZParts(targetBase, tz);
 
@@ -344,7 +316,6 @@ function resolveDateToISO(text) {
     tz
   );
 
-  // Output ISO with Toronto offset (NOT Z)
   return formatISOWithTZOffset(targetInstant, tz);
 }
 
@@ -360,11 +331,6 @@ function extractAction(text) {
 
 function getHost(req) {
   return BASE_URL || `https://${req.headers.host}`;
-}
-
-function ambientUrl(req) {
-  const host = getHost(req);
-  return `${host}/assets/shopping-mall.mp3`;
 }
 
 function formatTorontoConfirm(iso) {
@@ -393,52 +359,26 @@ function formatTorontoConfirm(iso) {
 }
 
 function torontoNowString() {
-  // human-readable, Toronto-local, avoids UTC confusion
   return new Date().toLocaleString("en-CA", { timeZone: "America/Toronto" });
-}
-
-function isCompleteBooking(action) {
-  return Boolean(
-    action &&
-      action.action === "book" &&
-      action.service &&
-      action.stylist &&
-      action.datetime &&
-      action.name &&
-      action.phone
-  );
-}
-
-function normalizePhone(s) {
-  const digits = String(s || "").replace(/\D/g, "");
-  if (!digits) return "";
-  if (digits.length > 10) return digits.slice(-10);
-  return digits;
 }
 
 function cleanSpeech(text) {
   return String(text || "")
     .toLowerCase()
-    .replace(/[^\w\s]/g, " ")   // remove punctuation (yes. -> yes)
+    .replace(/[^\w\s]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
 
 function isYes(text) {
   const t = cleanSpeech(text);
-
-  // If they said "no" anywhere, don't treat as yes
   if (/\b(no|nope|nah|negative|not|dont|do not)\b/.test(t)) return false;
-
   return /\b(yes|yeah|yep|yup|correct|confirm|confirmed|sure|okay|ok|sounds good|that works)\b/.test(t);
 }
 
 function isNo(text) {
   const t = cleanSpeech(text);
-
-  // If clearly yes, don't treat as no
   if (/\b(yes|yeah|yep|yup|correct|confirm|sure|okay|ok)\b/.test(t)) return false;
-
   return /\b(no|nope|nah|negative|incorrect|not right|cancel)\b/.test(t);
 }
 
@@ -447,24 +387,79 @@ function wantsHuman(text) {
   return /(human|manager|front desk|desk|reception|someone|representative|staff|person|talk to)/i.test(t);
 }
 
+// --- SLOT EXTRACTORS (server-side “memory”) ✅ NEW ---
+function extractName(text) {
+  const m = String(text || "").match(/\b(my name is|it'?s|i am)\s+([a-z]+(?:\s+[a-z]+)?)\b/i);
+  return m ? m[2].trim() : "";
+}
+
+function extractService(text) {
+  const t = String(text || "").toLowerCase();
+  const hasCut = t.includes("cut") || t.includes("haircut");
+  const hasColor = t.includes("colour") || t.includes("color");
+
+  if (hasCut && hasColor) return "cut & colour";
+  if (hasColor) return "colour";
+  if (hasCut) return "haircut";
+  return "";
+}
+
+function extractStylist(text) {
+  const t = String(text || "").toLowerCase();
+  if (t.includes("cassidy")) return "Cassidy";
+  if (t.includes("vince")) return "Vince";
+  if (t.includes("cosmo")) return "Cosmo";
+  return "";
+}
+
+// digits + “nine oh five” support
+function extractPhoneDigits(text) {
+  const t = String(text || "").toLowerCase();
+
+  const direct = t.replace(/\D/g, "");
+  if (direct.length >= 10) return direct.slice(-10);
+
+  const map = { zero:"0", oh:"0", o:"0", one:"1", two:"2", three:"3", four:"4", five:"5", six:"6", seven:"7", eight:"8", nine:"9" };
+  const words = t.split(/\s+/);
+  const joined = words.map(w => map[w] ?? "").join("");
+  if (joined.length >= 10) return joined.slice(-10);
+
+  return "";
+}
+
+function speakPhoneDigits(d10) {
+  // “9055551234” -> “9 0 5 5 5 5 1 2 3 4”
+  const s = String(d10 || "").replace(/\D/g, "").slice(-10);
+  return s.split("").join(" ");
+}
+
+function nextMissingQuestion(d) {
+  if (!d.service) return "What are you looking to book — a haircut, colour, or cut and colour?";
+  if (!d.stylist) return "Do you have a stylist you want — Cosmo, Vince, or Cassidy?";
+  if (!d.datetime) return "What day and time works best for you?";
+  if (!d.name) return "And what’s your name?";
+  if (!d.phone) return "What’s the best phone number to confirm the booking?";
+  return "";
+}
+
+function isDraftComplete(d) {
+  return Boolean(d.service && d.stylist && d.datetime && d.name && d.phone);
+}
+
 function sanitizeSpoken(text) {
   let out = String(text || "");
 
-  // Replace ISO timestamps with a Toronto-friendly phrase
   out = out.replace(
     /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?[+-]\d{2}:\d{2}/g,
     (iso) => formatTorontoConfirm(iso) || "that time"
   );
 
-  // If any raw date slips through
   out = out.replace(/\b\d{4}-\d{2}-\d{2}\b/g, "that date");
-
   return out;
 }
 
 /**
  * Post booking to Zapier and REQUIRE success.
- * If Zapier fails, do NOT hang up — keep caller in the loop.
  */
 async function postBookingToZapier(payload) {
   const url = process.env.BOOKING_WEBHOOK_URL;
@@ -472,7 +467,7 @@ async function postBookingToZapier(payload) {
 
   const resp = await http.post(url, payload, {
     timeout: 5000,
-    validateStatus: () => true, // don't throw on 4xx/5xx
+    validateStatus: () => true,
     headers: { "Content-Type": "application/json" },
   });
 
@@ -484,21 +479,23 @@ async function postBookingToZapier(payload) {
 
 // Cleanup so memory doesn't grow forever
 setInterval(() => {
-  // audio: keep last ~300 items
   if (audioStore.size > 300) {
     const keys = Array.from(audioStore.keys()).slice(0, audioStore.size - 300);
     keys.forEach((k) => audioStore.delete(k));
   }
 
-  // pendingTurns: expire after 2 minutes
   const now = Date.now();
   for (const [token, v] of pendingTurns.entries()) {
     if (now - v.createdAt > 120_000) pendingTurns.delete(token);
   }
 
-  // pendingBookings: expire after 10 minutes
   for (const [sid, v] of pendingBookings.entries()) {
     if (now - (v._createdAt || now) > 600_000) pendingBookings.delete(sid);
+  }
+
+  // bookingDrafts: expire after 15 minutes
+  for (const [sid, v] of bookingDrafts.entries()) {
+    if (now - (v._createdAt || now) > 900_000) bookingDrafts.delete(sid);
   }
 }, 30_000);
 
@@ -509,7 +506,7 @@ setInterval(() => {
  */
 app.get("/voice/incoming", async (req, res) => {
   try {
-    const greet = `Hi thanks for calling ${process.env.SALON_NAME || "the salon"}. My name is Alex, how can I help you?`;
+    const greet = `Hi thanks for calling ${process.env.SALON_NAME || "the salon"}. My name is Alex. How can I help you?`;
     let audio = await ttsWithRetry(greet);
     audio = await mixSpeechWithAmbient(audio);
     const id = uuidv4();
@@ -538,9 +535,9 @@ app.post("/voice/incoming", async (req, res) => {
   const actionUrl = `${host}/voice/turn`;
 
   try {
-    const greet = `Hi this ${process.env.SALON_NAME || "the salon"}. My name is Alex, how can I help you?`;
+    const greet = `Hi, thanks for calling ${process.env.SALON_NAME || "the salon"}. My name is Alex. How can I help you?`;
     let audio = await ttsWithRetry(greet);
-    audio = await mixSpeechWithAmbient(audio);   // ✅ this is the merge
+    audio = await mixSpeechWithAmbient(audio);
     const id = uuidv4();
     audioStore.set(id, audio);
 
@@ -562,7 +559,6 @@ app.post("/voice/incoming", async (req, res) => {
 
 /**
  * Turn handler: immediate filler + redirect polling until response is ready.
- * Background task generates the real response + stores final TwiML in pendingTurns.
  */
 app.post("/voice/turn", async (req, res) => {
   const host = getHost(req);
@@ -572,7 +568,7 @@ app.post("/voice/turn", async (req, res) => {
     const callSid = req.body.CallSid || "no-callsid";
     const userSpeech = req.body.SpeechResult || "";
 
-    // Init memory for this call (Toronto-local now)
+    // Init memory for this call
     if (!conversationStore.has(callSid)) {
       conversationStore.set(callSid, [
         {
@@ -590,20 +586,14 @@ If no year is specified, assume the next upcoming future date.
       ]);
     }
 
+    // Keep the convo log (still useful for transfer requests + general chat)
     const messages = conversationStore.get(callSid);
-const resolvedISO = resolveDateToISO(userSpeech);
+    const resolvedISO = resolveDateToISO(userSpeech);
 
-if (resolvedISO) {
-  messages.push({
-    role: "user",
-    content: `${userSpeech} (resolved datetime: ${resolvedISO})`
-  });
-} else {
-  messages.push({
-    role: "user",
-    content: userSpeech
-  });
-}
+    messages.push({
+      role: "user",
+      content: resolvedISO ? `${userSpeech} (resolved datetime: ${resolvedISO})` : userSpeech
+    });
 
     // Create pending token for this turn
     const token = uuidv4();
@@ -616,7 +606,7 @@ if (resolvedISO) {
       fillerId,
     });
 
-    // Background work (don’t await)
+    // Background work
     (async () => {
       const entry = pendingTurns.get(token);
       if (!entry) return;
@@ -624,7 +614,7 @@ if (resolvedISO) {
       try {
         const pendingBooking = pendingBookings.get(callSid);
 
-        // ✅ If we were in confirm state and they say YES: post + hang up (only if Zapier succeeds)
+        // ✅ CONFIRM STATE: YES -> post + hangup
         if (pendingBooking && isYes(userSpeech)) {
           const pretty = formatTorontoConfirm(pendingBooking.datetime) || pendingBooking.datetime;
 
@@ -644,6 +634,7 @@ if (resolvedISO) {
 </Response>`;
 
             pendingBookings.delete(callSid);
+            bookingDrafts.delete(callSid);
             conversationStore.delete(callSid);
             return;
           } catch (err) {
@@ -664,7 +655,7 @@ if (resolvedISO) {
           }
         }
 
-        // ✅ If we were in confirm state and they say NO: clear pending + ask correction (never transfer)
+        // ✅ CONFIRM STATE: NO -> clear + ask correction
         if (pendingBooking && isNo(userSpeech)) {
           pendingBookings.delete(callSid);
 
@@ -681,81 +672,78 @@ if (resolvedISO) {
           return;
         }
 
-        // ✅ If there was a pending booking and user is correcting (e.g., “Tuesday at 4”), force re-parse and keep old fields
+        // ✅ If correcting while pending booking, keep old slots but allow new datetime
         if (pendingBooking && !isYes(userSpeech) && !isNo(userSpeech)) {
-          messages.push({
-            role: "system",
-            content:
-              `The caller is correcting the appointment time. Keep service="${pendingBooking.service}", stylist="${pendingBooking.stylist}", name="${pendingBooking.name}", phone="${pendingBooking.phone}". ` +
-              `Update ONLY datetime based on the caller's correction and output ACTION_JSON book with updated datetime.`,
+          // Put pending booking back into draft so slot flow continues cleanly
+          bookingDrafts.set(callSid, {
+            service: pendingBooking.service,
+            stylist: pendingBooking.stylist,
+            datetime: "", // force re-ask/resolution
+            name: pendingBooking.name,
+            phone: pendingBooking.phone,
+            _createdAt: Date.now(),
           });
           pendingBookings.delete(callSid);
         }
 
-        // ---- OpenAI ----
-        let reply = "Sorry—could you say that again?";
+        // -------- SERVER-SIDE SLOT MEMORY (draft) ✅ --------
+        const draft = bookingDrafts.get(callSid) || { service:"", stylist:"", datetime:"", name:"", phone:"", _createdAt: Date.now() };
 
-        try {
-          const r = await http.post(
-            "https://api.openai.com/v1/chat/completions",
-            {
-              model: "gpt-4o-mini",
-              temperature: 0.2,
-              max_tokens: 110,
-              messages,
-            },
-            {
-              headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-              timeout: 8000,
-            }
-          );
+        // Update from this turn
+        const svc = extractService(userSpeech);
+        const sty = extractStylist(userSpeech);
+        const dt  = resolveDateToISO(userSpeech);
+        const nm  = extractName(userSpeech);
+        const ph  = extractPhoneDigits(userSpeech);
 
-          reply = r.data.choices?.[0]?.message?.content?.trim() || reply;
-          messages.push({ role: "assistant", content: reply });
-        } catch (e) {
-          console.log("❌ OpenAI error", e?.response?.status, e?.response?.data || e?.message);
-        }
+        if (!draft.service && svc) draft.service = svc;
+        if (!draft.stylist && sty) draft.stylist = sty;
+        if (!draft.datetime && dt) draft.datetime = dt;
+        if (!draft.name && nm) draft.name = nm;
+        if (!draft.phone && ph) draft.phone = ph;
 
-        const action = extractAction(reply);
-        console.log("AI RAW REPLY:", reply);
-        console.log("PARSED ACTION:", action);
+        // If they just gave a phone, immediately confirm it out loud (digits spaced)
+        // and keep going.
+        bookingDrafts.set(callSid, draft);
 
-        // Transfer: ONLY if caller actually asked for a human (prevents random transfers)
-        if (action?.action === "transfer" && process.env.SALON_PHONE && wantsHuman(userSpeech)) {
-          const transferLine = "Okay, I’ll connect you to the salon now.";
-          const audio = await ttsWithRetry(transferLine);
+        const missingQ = nextMissingQuestion(draft);
+
+        // If still missing something, ASK IT YOURSELF (skip OpenAI)
+        if (missingQ) {
+          // special case: if we just captured phone, confirm it in the same turn
+          let line = missingQ;
+          if (ph) {
+            line = `Just to confirm, that’s ${speakPhoneDigits(draft.phone)}. ${missingQ}`;
+          }
+
+          const audio = await ttsWithRetry(line);
           const id = uuidv4();
           audioStore.set(id, audio);
 
           entry.ready = true;
           entry.twiml = `<Response>
   <Play>${host}/audio/${id}.mp3</Play>
-  <Dial>${process.env.SALON_PHONE}</Dial>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
 </Response>`;
-
-          pendingBookings.delete(callSid);
-          conversationStore.delete(callSid);
           return;
         }
 
-        // Spoken text (strip ACTION_JSON if present) + server-sanitize any ISO leaks
-        let spoken = reply.replace(/ACTION_JSON:[\s\S]*$/, "").trim() || "Got it.";
-        spoken = sanitizeSpoken(spoken);
+        // Draft complete -> create booking payload + ask your existing confirmation question
+        if (isDraftComplete(draft)) {
+          const booking = {
+            action: "book",
+            service: draft.service,
+            stylist: draft.stylist,
+            datetime: draft.datetime,
+            name: draft.name,
+            phone: draft.phone,
+            _createdAt: Date.now(),
+          };
 
-        // If model tries to book without full payload, keep convo going
-        if (action?.action === "book" && !isCompleteBooking(action)) {
-          spoken = "Quick check — what’s the best phone number to confirm the booking?";
-        }
+          pendingBookings.set(callSid, booking);
 
-        // Booking complete -> store + ask for confirmation (server controls the confirmation message)
-        if (isCompleteBooking(action)) {
-          action.phone = normalizePhone(action.phone) || action.phone;
-          action._createdAt = Date.now();
-
-          pendingBookings.set(callSid, action);
-
-          const pretty = formatTorontoConfirm(action.datetime) || action.datetime;
-          const confirmLine = `Just to confirm: a ${action.service} with ${action.stylist} on ${pretty}, correct?`;
+          const pretty = formatTorontoConfirm(booking.datetime) || booking.datetime;
+          const confirmLine = `Just to confirm: a ${booking.service} with ${booking.stylist} on ${pretty}, correct?`;
 
           const audio = await ttsWithRetry(confirmLine);
           const id = uuidv4();
@@ -769,8 +757,51 @@ if (resolvedISO) {
           return;
         }
 
-        // Normal conversational turn
-        const audio = await ttsWithRetry(spoken);
+        // -------- OPENAI (only used for non-booking chatter / transfer requests) --------
+        // If the user asked for a human, let OpenAI decide transfer only for that case
+        if (wantsHuman(userSpeech)) {
+          let reply = "Okay — I’ll connect you to the salon now.";
+
+          try {
+            const r = await http.post(
+              "https://api.openai.com/v1/chat/completions",
+              {
+                model: "gpt-4o-mini",
+                temperature: 0.2,
+                max_tokens: 80,
+                messages,
+              },
+              {
+                headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+                timeout: 8000,
+              }
+            );
+
+            reply = r.data.choices?.[0]?.message?.content?.trim() || reply;
+            messages.push({ role: "assistant", content: reply });
+          } catch (e) {
+            console.log("❌ OpenAI error", e?.response?.status, e?.response?.data || e?.message);
+          }
+
+          const action = extractAction(reply);
+
+          if (action?.action === "transfer" && process.env.SALON_PHONE) {
+            const transferLine = "Okay, I’ll connect you to the salon now.";
+            const audio = await ttsWithRetry(transferLine);
+            const id = uuidv4();
+            audioStore.set(id, audio);
+
+            entry.ready = true;
+            entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Dial>${process.env.SALON_PHONE}</Dial>
+</Response>`;
+            return;
+          }
+        }
+
+        // fallback
+        const audio = await ttsWithRetry("Got it. What are you looking to book?");
         const id = uuidv4();
         audioStore.set(id, audio);
 
@@ -792,17 +823,17 @@ if (resolvedISO) {
       }
     })();
 
-    // Immediate TwiML: play ONE filler clip (if available), then redirect to poll
+    // Immediate TwiML: play ONE filler clip, then poll
     const pollUrl = `${host}/voice/turn/result?token=${encodeURIComponent(token)}`;
 
     if (fillerId) {
-  return res.type("text/xml").send(
+      return res.type("text/xml").send(
 `<Response>
   <Play>${host}/audio/${fillerId}.mp3</Play>
   <Redirect method="GET">${pollUrl}</Redirect>
 </Response>`
-  );
-}
+      );
+    }
 
     return res.type("text/xml").send(
 `<Response>
@@ -822,8 +853,7 @@ if (resolvedISO) {
 });
 
 /**
- * Poll endpoint: if not ready, DO NOT replay filler.
- * Just pause + redirect until the final TwiML is ready.
+ * Poll endpoint
  */
 app.get("/voice/turn/result", async (req, res) => {
   const host = getHost(req);
@@ -838,7 +868,6 @@ app.get("/voice/turn/result", async (req, res) => {
       return res.type("text/xml").send(pending.twiml);
     }
 
-    // token missing/expired -> recover gracefully
     if (!pending) {
       const repeatId = clipIds.repeat || (await ensureClip("repeat", "Sorry—could you say that again?"));
       return res.type("text/xml").send(
@@ -850,7 +879,6 @@ app.get("/voice/turn/result", async (req, res) => {
     }
 
     const pollUrl = `${host}/voice/turn/result?token=${encodeURIComponent(token)}`;
-
     return res.type("text/xml").send(
 `<Response>
   <Pause length="1" />
@@ -869,7 +897,7 @@ app.get("/voice/turn/result", async (req, res) => {
 });
 
 /**
- * Audio playback endpoint Twilio hits after <Play>
+ * Audio playback endpoint
  */
 app.get("/audio/:id.mp3", (req, res) => {
   const id = (req.params.id || "").replace(".mp3", "");
@@ -901,6 +929,7 @@ app.get("/env-check", (_, res) => {
     repeatClip: clipIds.repeat ? "ready" : "missing",
     pendingTurns: pendingTurns.size,
     pendingBookings: pendingBookings.size,
+    bookingDrafts: bookingDrafts.size,
   });
 });
 
@@ -919,7 +948,7 @@ app.get("/", (_, res) => res.send("Hair Hunters Voicebot is running ✅"));
 
 const PORT = process.env.PORT || 3000;
 
-// Warm fillers first (fast playback), then listen
+// Warm fillers first, then listen
 (async () => {
   await warmFillers();
   app.listen(PORT, () => console.log(`Voice bot running on port ${PORT}`));
