@@ -375,6 +375,22 @@ async function postBookingToZapier(payload) {
   if (resp.status < 200 || resp.status >= 300) throw new Error(`Zapier returned ${resp.status}`);
 }
 
+function digitsOnly(s) {
+  return String(s || "").replace(/\D/g, "");
+}
+
+function speakDigits(digits) {
+  return String(digits).split("").join(" ");
+}
+
+function extractLikelyPhoneFromSpeech(s) {
+  // Handles both digits and cases where Twilio returns "905 555 8851"
+  const d = digitsOnly(s);
+  if (d.length === 11 && d.startsWith("1")) return d.slice(1);
+  if (d.length >= 10) return d.slice(-10);
+  return "";
+}
+
 // Cleanup so memory doesn't grow forever
 setInterval(() => {
   if (audioStore.size > 300) {
@@ -448,6 +464,7 @@ app.post("/voice/turn", async (req, res) => {
   try {
     const callSid = req.body.CallSid || "no-callsid";
     const userSpeech = req.body.SpeechResult || "";
+    
 
     if (!conversationStore.has(callSid)) {
       conversationStore.set(callSid, [
@@ -467,6 +484,33 @@ If no year is specified, assume the next upcoming future date.
     }
 
     const messages = conversationStore.get(callSid);
+
+const maybePhone = extractLikelyPhoneFromSpeech(userSpeech);
+
+// If they just said a phone number, handle it immediately
+if (maybePhone.length === 10) {
+
+  // store it properly in conversation
+  messages.push({
+    role: "user",
+    content: `My phone number is ${maybePhone}`
+  });
+
+  // 🔥 FORCE correct confirmation (don’t let AI freestyle this)
+  const spoken = `Perfect — I got ${maybePhone.split("").join(" ")}. What service would you like to book?`;
+
+  const audio = await ttsWithRetry(spoken);
+  const id = uuidv4();
+  audioStore.set(id, audio);
+
+  return res.type("text/xml").send(
+`<Response>
+  <Play>${getHost(req)}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${getHost(req)}/voice/turn" method="POST" speechTimeout="auto" />
+</Response>`
+  );
+}
+    
     const resolvedISO = resolveDateToISO(userSpeech);
 
     if (resolvedISO) {
