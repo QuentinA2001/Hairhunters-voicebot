@@ -538,7 +538,7 @@ app.post("/voice/incoming", async (req, res) => {
   const actionUrl = `${host}/voice/turn`;
 
   try {
-    const greet = `Hi! Thanks for calling ${process.env.SALON_NAME || "the salon"}. How can I help you today?`;
+    const greet = `Hi this ${process.env.SALON_NAME || "the salon"}. My name is Alex, how can I help you?`;
     let audio = await ttsWithRetry(greet);
     audio = await mixSpeechWithAmbient(audio);   // ✅ this is the merge
     const id = uuidv4();
