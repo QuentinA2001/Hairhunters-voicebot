@@ -414,6 +414,17 @@ function getHost(req) {
   return BASE_URL || `https://${req.headers.host}`;
 }
 
+function formatTimeForSpeechFromISO(iso) {
+  const dt = DateTime.fromISO(String(iso || ""), { zone: BOT_TZ });
+  if (!dt.isValid) return null;
+
+  const hour12 = dt.toFormat("h");
+  const minute = dt.minute;
+  const suffix = dt.hour >= 12 ? "PM" : "AM";
+  if (minute === 0) return `${hour12} ${suffix}`;
+  return `${hour12}:${String(minute).padStart(2, "0")} ${suffix}`;
+}
+
 function formatTorontoConfirm(iso) {
   const d = new Date(iso);
   if (isNaN(d.getTime())) return null;
@@ -429,12 +440,8 @@ function formatTorontoConfirm(iso) {
     day: "numeric",
   }).format(d);
 
-  const timePretty = new Intl.DateTimeFormat("en-CA", {
-    timeZone: BOT_TZ,
-    hour: "numeric",
-    minute: "numeric",
-    hour12: true,
-  }).format(d);
+  const timePretty = formatTimeForSpeechFromISO(iso);
+  if (!timePretty) return null;
 
   return `${weekday}, ${datePretty} at ${timePretty}`;
 }
@@ -522,6 +529,17 @@ function sanitizeSpoken(text) {
     (iso) => formatTorontoConfirm(iso) || "that time"
   );
   out = out.replace(/\b\d{4}-\d{2}-\d{2}\b/g, "that date");
+  out = out.replace(/\b(\d{1,2})(?::([0-5]\d))?\s+y+\s*(a\.?m\.?|p\.?m\.?)\b/gi, (_m, h, mm, ap) => {
+    const suffix = /^p/i.test(ap) ? "PM" : "AM";
+    if (!mm) return `${h} ${suffix}`;
+    return `${h}:${mm} ${suffix}`;
+  });
+  out = out.replace(/\b(\d{1,2})(?::([0-5]\d))?\s*(a\.?m\.?|p\.?m\.?)\b/gi, (_m, h, mm, ap) => {
+    const suffix = /^p/i.test(ap) ? "PM" : "AM";
+    if (!mm) return `${h} ${suffix}`;
+    return `${h}:${mm} ${suffix}`;
+  });
+  out = out.replace(/\s+/g, " ").trim();
   return out;
 }
 
