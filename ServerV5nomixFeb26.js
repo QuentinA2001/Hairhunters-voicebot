@@ -7,7 +7,7 @@ import https from "https";
 import { v4 as uuidv4 } from "uuid";
 import "dotenv/config";
 
-// ✅ date parsing add-on
+// ✅ NEW: date parsing add-on
 import * as chrono from "chrono-node";
 import { DateTime } from "luxon";
 
@@ -24,7 +24,7 @@ app.use("/assets", express.static("assets"));
  */
 const BASE_URL = process.env.BASE_URL || "";
 
-// timezone config
+// ✅ NEW: timezone config (set BOT_TIMEZONE in Render if you want)
 const BOT_TZ = process.env.BOT_TIMEZONE || "America/Toronto";
 
 // In-memory stores (OK for MVP; use Redis/S3 for production)
@@ -32,9 +32,7 @@ const audioStore = new Map();            // id -> Buffer(mp3)
 const conversationStore = new Map();     // callSid -> messages[]
 const pendingTurns = new Map();          // token -> { ready, twiml, createdAt, fillerId }
 const pendingBookings = new Map();       // callSid -> booking payload waiting for confirm
-
-// ✅ NEW: remembers last resolved DATE (even without time) per call
-const lastResolvedDateStore = new Map(); // callSid -> "YYYY-MM-DD"
+const lastResolvedDateStore = new Map(); // callSid -> YYYY-MM-DD
 
 // Keep-alive HTTP client (reduces latency)
 const httpsAgent = new https.Agent({ keepAlive: true });
@@ -74,7 +72,9 @@ Tasks:
 
 IMPORTANT:
 - Do NOT do calendar math or guess weekdays/dates. If the caller asks “what date is that?”, the server will answer.
-- If you only have a day (e.g., “next Tuesday”) but no time, ask for the time.
+- The server may append "(resolved date: YYYY-MM-DD)" or "(resolved datetime: YYYY-MM-DDTHH:mm:ss-05:00)" to caller turns.
+- Treat server-resolved date/datetime as ground truth.
+- If you only have a day (e.g., "next Tuesday") but no time, ask for the time.
 
 - If caller asks for a human/manager/desk, respond with:
 ACTION_JSON: {"action":"transfer"}
@@ -113,7 +113,7 @@ async function tts(text) {
           Accept: "audio/mpeg",
         },
         responseType: "arraybuffer",
-        timeout: 8000,
+        timeout: 8000, // keep tight for Twilio stability
       }
     );
 
@@ -168,24 +168,133 @@ async function warmFillers() {
 }
 
 // ---------- HELPERS ----------
+const STYLISTS = ["cosmo", "vince", "cassidy"];
+const SERVICES = [
+  { key: "cut & colour", patterns: ["cut and colour", "cut & colour", "cut and color", "cut & color"] },
+  { key: "haircut", patterns: ["haircut", "trim", "cut"] },
+  { key: "colour", patterns: ["colour", "color", "dye"] },
+];
+const WEEKDAY_ALIASES = [
+  { weekday: 1, re: /\b(?:mon|monday)\b/ },
+  { weekday: 2, re: /\b(?:tue|tues|tuesday)\b/ },
+  { weekday: 3, re: /\b(?:wed|wednesday)\b/ },
+  { weekday: 4, re: /\b(?:thu|thur|thurs|thursday)\b/ },
+  { weekday: 5, re: /\b(?:fri|friday)\b/ },
+  { weekday: 6, re: /\b(?:sat|saturday)\b/ },
+  { weekday: 7, re: /\b(?:sun|sunday)\b/ },
+];
+const DATE_WORD_RE =
+  /\b(?:mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?|today|tomorrow|january|february|march|april|may|june|july|august|september|october|november|december|next|this|coming)\b/;
 
-function cleanSpeech(text) {
-  return String(text || "")
-    .toLowerCase()
-    .replace(/[^\w\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function asksWhatDate(text) {
+function extractStylistFromSpeech(text) {
   const t = cleanSpeech(text);
-  return /\b(what date|which date|what day is that|what day would that be|what day is it|what date would that be)\b/.test(t);
+  for (const s of STYLISTS) {
+    if (t.includes(s)) return s[0].toUpperCase() + s.slice(1);
+  }
+  return null;
 }
 
-// ✅ DATE-ONLY resolver: "next Tuesday" -> "YYYY-MM-DD"
+function extractServiceFromSpeech(text) {
+  const t = cleanSpeech(text);
+  const ranked = SERVICES
+    .flatMap((svc) => svc.patterns.map((p) => ({ key: svc.key, pattern: p })))
+    .sort((a, b) => b.pattern.length - a.pattern.length);
+  for (const item of ranked) {
+    if (t.includes(item.pattern)) return item.key;
+  }
+  return null;
+}
+
+function extractTimeOnly(text) {
+  const t = cleanSpeech(text);
+  if (!t) return null;
+  if (/\d{3,}/.test(t)) return null;
+  if (DATE_WORD_RE.test(t)) return null;
+
+  const allow = new Set(["at", "around", "for", "please", "pls", "ok", "okay", "works", "work", "that", "sounds", "good"]);
+  const leftoversAllowed = (leftovers) =>
+    !leftovers || leftovers.split(/\s+/).every((w) => allow.has(w));
+
+  let m = t.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
+  if (m) {
+    const leftovers = t.replace(m[0], "").trim();
+    if (!leftoversAllowed(leftovers)) return null;
+    return { hour: parseInt(m[1], 10), minute: parseInt(m[2], 10) };
+  }
+
+  m = t.match(/\b(1[0-2]|[1-9])(?::([0-5]\d))?\s*(am|pm)?\b/);
+  if (!m) return null;
+  const leftovers = t.replace(m[0], "").trim();
+  if (!leftoversAllowed(leftovers)) return null;
+
+  let hour = parseInt(m[1], 10);
+  const minute = m[2] ? parseInt(m[2], 10) : 0;
+  const ampm = m[3] || null;
+
+  if (!ampm) {
+    if (hour >= 1 && hour <= 7) hour += 12;
+  } else {
+    if (ampm === "pm" && hour !== 12) hour += 12;
+    if (ampm === "am" && hour === 12) hour = 0;
+  }
+
+  return { hour, minute };
+}
+
+function extractTimeFromSpeech(text) {
+  const input = String(text || "").trim();
+  if (!input) return null;
+
+  const now = DateTime.now().setZone(BOT_TZ);
+  const results = chrono.parse(input, now.toJSDate());
+  if (results.length) {
+    const kv = results[0]?.start?.knownValues || {};
+    if ("hour" in kv || "minute" in kv) {
+      const hour = Number(kv.hour ?? 0);
+      const minute = Number(kv.minute ?? 0);
+      if (!Number.isNaN(hour) && !Number.isNaN(minute)) return { hour, minute };
+    }
+  }
+
+  return extractTimeOnly(input);
+}
+
+function detectWeekday(text) {
+  const t = cleanSpeech(text);
+  const hit = WEEKDAY_ALIASES.find((d) => d.re.test(t));
+  return hit ? hit.weekday : null;
+}
+
+function resolveRelativeDayISO(text) {
+  const t = cleanSpeech(text);
+  const now = DateTime.now().setZone(BOT_TZ).startOf("day");
+  if (/\bday after tomorrow\b/.test(t)) return now.plus({ days: 2 }).toFormat("yyyy-LL-dd");
+  if (/\btomorrow\b/.test(t)) return now.plus({ days: 1 }).toFormat("yyyy-LL-dd");
+  if (/\btoday\b/.test(t)) return now.toFormat("yyyy-LL-dd");
+  return null;
+}
+
+function resolveUpcomingWeekdayISO(text) {
+  const t = cleanSpeech(text);
+  const weekday = detectWeekday(t);
+  if (!weekday) return null;
+
+  const now = DateTime.now().setZone(BOT_TZ).startOf("day");
+  let daysAhead = (weekday - now.weekday + 7) % 7;
+  const explicitThis = /\b(this|coming)\b/.test(t);
+  if (daysAhead === 0 && !explicitThis) daysAhead = 7;
+  return now.plus({ days: daysAhead }).toFormat("yyyy-LL-dd");
+}
+
 function resolveDateOnlyISO(text) {
   const input = String(text || "").trim();
   if (!input) return null;
+
+  const relative = resolveRelativeDayISO(input);
+  if (relative) return relative;
+
+  const weekdayDate = resolveUpcomingWeekdayISO(input);
+  if (weekdayDate) return weekdayDate;
 
   const now = DateTime.now().setZone(BOT_TZ);
   const results = chrono.parse(input, now.toJSDate());
@@ -193,14 +302,11 @@ function resolveDateOnlyISO(text) {
 
   const r = results[0];
   const kv = r?.start?.knownValues || {};
-
   const hasDateInfo =
     ("weekday" in kv) || ("day" in kv) || ("month" in kv) || ("year" in kv);
   if (!hasDateInfo) return null;
 
   let dt = DateTime.fromJSDate(r.start.date()).setZone(BOT_TZ);
-
-  // If no year specified and it resolved into the past, bump forward
   const specifiedYear = ("year" in kv);
   if (!specifiedYear && dt < now.startOf("day")) {
     const weekdayOnly = ("weekday" in kv) && !("month" in kv) && !("day" in kv);
@@ -212,65 +318,33 @@ function resolveDateOnlyISO(text) {
   return dt.toFormat("yyyy-LL-dd");
 }
 
-function formatTorontoDateOnly(dateISO) {
-  // Use noon to avoid timezone edges
-  const d = new Date(`${dateISO}T12:00:00`);
-  if (isNaN(d.getTime())) return null;
-
-  const weekday = new Intl.DateTimeFormat("en-CA", {
-    timeZone: BOT_TZ,
-    weekday: "long",
-  }).format(d);
-
-  const datePretty = new Intl.DateTimeFormat("en-CA", {
-    timeZone: BOT_TZ,
-    month: "long",
-    day: "numeric",
-  }).format(d);
-
-  return `${weekday}, ${datePretty}`;
+function buildISOFromDateAndTime(dateISO, timeObj) {
+  const dt = DateTime.fromISO(`${dateISO}T00:00:00`, { zone: BOT_TZ })
+    .set({ hour: timeObj.hour, minute: timeObj.minute, second: 0, millisecond: 0 });
+  return dt.isValid ? dt.toISO({ suppressMilliseconds: true, includeOffset: true }) : null;
 }
 
-// ✅ DATE+TIME resolver: only returns when time exists
 function resolveDateToISO(text) {
   const input = String(text || "").trim();
   if (!input) return null;
 
   const now = DateTime.now().setZone(BOT_TZ);
+  const dateISO = resolveDateOnlyISO(input);
+  if (!dateISO) return null;
 
-  const results = chrono.parse(input, now.toJSDate());
-  if (!results.length) return null;
+  const timeObj = extractTimeFromSpeech(input);
+  if (!timeObj) return null;
 
-  const r = results[0];
-  const kv = r?.start?.knownValues || {};
+  let dt = DateTime.fromISO(`${dateISO}T00:00:00`, { zone: BOT_TZ }).set({
+    hour: timeObj.hour,
+    minute: timeObj.minute,
+    second: 0,
+    millisecond: 0,
+  });
+  if (!dt.isValid) return null;
 
-  const hasDateInfo =
-    ("weekday" in kv) || ("day" in kv) || ("month" in kv) || ("year" in kv);
-  if (!hasDateInfo) return null;
-
-  // Require time info so we don't default to noon
-  const hasTimeInfo =
-    ("hour" in kv) ||
-    ("minute" in kv) ||
-    /\b(noon|midnight)\b/i.test(input) ||
-    /\b(\d{1,2})(?::\d{2})?\s*(am|pm)?\b/i.test(input);
-
-  if (!hasTimeInfo) return null;
-
-  let dt = DateTime.fromJSDate(r.start.date()).setZone(BOT_TZ);
-
-  // Never book in the past (best-effort bump if year wasn't explicitly said)
-  const specifiedYear = ("year" in kv);
-  const specifiedMonthDay = ("month" in kv) && ("day" in kv);
-  const specifiedWeekdayOnly = ("weekday" in kv) && !("month" in kv) && !("day" in kv);
-
-  if (dt < now) {
-    if (!specifiedYear) {
-      if (specifiedWeekdayOnly) dt = dt.plus({ days: 7 });
-      else if (specifiedMonthDay) dt = dt.plus({ years: 1 });
-    }
-  }
-
+  if (dt < now && detectWeekday(input)) dt = dt.plus({ days: 7 });
+  if (dt < now) return null;
   return dt.toISO({ suppressMilliseconds: true, includeOffset: true });
 }
 
@@ -332,6 +406,43 @@ function normalizePhone(s) {
   return digits;
 }
 
+function cleanSpeech(text) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function asksWhatDate(text) {
+  const t = cleanSpeech(text);
+  if (!t) return false;
+  if (/\bwhat(?:s| is)?\s+(?:the\s+)?(?:date|day)\b/.test(t)) return true;
+  if (/\bwhich\s+(?:date|day)\b/.test(t)) return true;
+  if (/\bwhat\s+day\s+(?:is|would|will)\s+that\b/.test(t)) return true;
+  if (/\bwhat\s+date\s+(?:is|would|will)\s+that\b/.test(t)) return true;
+  if (/\b(?:date|day)\s+again\b/.test(t)) return true;
+  return /\b(what|which|when)\b/.test(t) && /\b(date|day|weekday)\b/.test(t);
+}
+
+function formatTorontoDateOnly(dateISO) {
+  const d = new Date(`${dateISO}T12:00:00`);
+  if (isNaN(d.getTime())) return null;
+
+  const weekday = new Intl.DateTimeFormat("en-CA", {
+    timeZone: BOT_TZ,
+    weekday: "long",
+  }).format(d);
+
+  const datePretty = new Intl.DateTimeFormat("en-CA", {
+    timeZone: BOT_TZ,
+    month: "long",
+    day: "numeric",
+  }).format(d);
+
+  return `${weekday}, ${datePretty}`;
+}
+
 function isYes(text) {
   const t = cleanSpeech(text);
   if (/\b(no|nope|nah|negative|not|dont|do not)\b/.test(t)) return false;
@@ -358,6 +469,39 @@ function sanitizeSpoken(text) {
   return out;
 }
 
+function getNextMissingQuestion(draft) {
+  if (!draft.service) return "What service would you like to book?";
+  if (!draft.stylist) return "Which stylist would you like: Cosmo, Vince, or Cassidy?";
+  if (!draft.datetime) return draft.date ? "What time works for you?" : "What day works best for you?";
+  if (!draft.name) return "Can I get your name for the booking?";
+  if (!draft.phone) return "What’s the best 10-digit phone number for the booking?";
+  return null;
+}
+
+function mergeBookActionWithDraft(action, draft) {
+  if (!action || action.action !== "book") return action;
+  return {
+    action: "book",
+    service: action.service || draft.service || "",
+    stylist: action.stylist || draft.stylist || "",
+    datetime: action.datetime || draft.datetime || "",
+    name: action.name || draft.name || "",
+    phone: normalizePhone(action.phone || draft.phone || ""),
+  };
+}
+
+function draftToBookAction(draft) {
+  if (!draft.service || !draft.stylist || !draft.datetime || !draft.name || !draft.phone) return null;
+  return {
+    action: "book",
+    service: draft.service,
+    stylist: draft.stylist,
+    datetime: draft.datetime,
+    name: draft.name,
+    phone: normalizePhone(draft.phone),
+  };
+}
+
 async function postBookingToZapier(payload) {
   const url = process.env.BOOKING_WEBHOOK_URL;
   if (!url) throw new Error("BOOKING_WEBHOOK_URL missing");
@@ -371,6 +515,7 @@ async function postBookingToZapier(payload) {
   console.log("📨 Zapier POST result:", { status: resp.status });
   if (resp.status < 200 || resp.status >= 300) throw new Error(`Zapier returned ${resp.status}`);
 }
+
 
 // Cleanup so memory doesn't grow forever
 setInterval(() => {
@@ -388,10 +533,13 @@ setInterval(() => {
     if (now - (v._createdAt || now) > 600_000) pendingBookings.delete(sid);
   }
 
-  // ✅ also clean date-only memory
-  for (const [sid, date] of lastResolvedDateStore.entries()) {
-    void date;
-    // best-effort: if the convo is gone, drop it too
+  for (const sid of bookingDraftStore.keys()) {
+    if (!conversationStore.has(sid)) bookingDraftStore.delete(sid);
+  }
+  for (const sid of awaitingPhoneConfirm.keys()) {
+    if (!conversationStore.has(sid)) awaitingPhoneConfirm.delete(sid);
+  }
+  for (const sid of lastResolvedDateStore.keys()) {
     if (!conversationStore.has(sid)) lastResolvedDateStore.delete(sid);
   }
 }, 30_000);
@@ -434,8 +582,13 @@ function extractLikelyPhoneFromSpeech(speech) {
   // keep only digits
   const digits = t.replace(/\D/g, "");
 
+  // prefer a clean 10-digit number if present anywhere
   if (digits.length === 10) return digits;
+
+  // if longer, take last 10 (handles “+1 905...” etc)
   if (digits.length > 10) return digits.slice(-10);
+
+  // if shorter, return as-is (caller may be mid-number)
   return digits;
 }
 
@@ -449,6 +602,7 @@ function setDraft(callSid, patch) {
 
 function draftSummarySystem(draft) {
   const parts = [];
+  if (draft.date) parts.push(`date="${draft.date}"`);
   if (draft.name) parts.push(`name="${draft.name}"`);
   if (draft.phone) parts.push(`phone="${draft.phone}"`);
   if (draft.service) parts.push(`service="${draft.service}"`);
@@ -514,9 +668,18 @@ app.post("/voice/turn", async (req, res) => {
     const callSid = req.body.CallSid || "no-callsid";
     const userSpeech = req.body.SpeechResult || "";
 
-    // ✅ store date-only resolution every turn (even without time)
-    const resolvedDateOnly = resolveDateOnlyISO(userSpeech);
-    if (resolvedDateOnly) lastResolvedDateStore.set(callSid, resolvedDateOnly);
+    // Server-owned slot extraction on every utterance
+    let foundDateOnly = resolveDateOnlyISO(userSpeech);
+    const speechPatch = {};
+    const foundStylist = extractStylistFromSpeech(userSpeech);
+    const foundService = extractServiceFromSpeech(userSpeech);
+    if (foundStylist) speechPatch.stylist = foundStylist;
+    if (foundService) speechPatch.service = foundService;
+    if (foundDateOnly) {
+      speechPatch.date = foundDateOnly;
+      lastResolvedDateStore.set(callSid, foundDateOnly);
+    }
+    if (Object.keys(speechPatch).length) setDraft(callSid, speechPatch);
 
     if (!conversationStore.has(callSid)) {
       conversationStore.set(callSid, [
@@ -536,14 +699,33 @@ If no year is specified, assume the next upcoming future date.
     }
 
     const messages = conversationStore.get(callSid);
+    let finalResolvedISO = resolveDateToISO(userSpeech);
 
-    // date+time resolution (only when time exists)
-    const resolvedISO = resolveDateToISO(userSpeech);
+    if (!finalResolvedISO) {
+      const draft = getDraft(callSid);
+      const timeOnly = extractTimeOnly(userSpeech);
+      if (draft?.date && timeOnly) {
+        finalResolvedISO = buildISOFromDateAndTime(draft.date, timeOnly);
+      }
+    }
 
-    if (resolvedISO) {
+    if (finalResolvedISO) {
+      const dt = DateTime.fromISO(finalResolvedISO, { zone: BOT_TZ });
+      if (dt.isValid) {
+        foundDateOnly = dt.toFormat("yyyy-LL-dd");
+        setDraft(callSid, { date: foundDateOnly, datetime: finalResolvedISO });
+        lastResolvedDateStore.set(callSid, foundDateOnly);
+      } else {
+        setDraft(callSid, { datetime: finalResolvedISO });
+      }
       messages.push({
         role: "user",
-        content: `${userSpeech} (resolved datetime: ${resolvedISO})`,
+        content: `${userSpeech} (resolved datetime: ${finalResolvedISO})`,
+      });
+    } else if (foundDateOnly) {
+      messages.push({
+        role: "user",
+        content: `${userSpeech} (resolved date: ${foundDateOnly})`,
       });
     } else {
       messages.push({ role: "user", content: userSpeech });
@@ -564,11 +746,11 @@ If no year is specified, assume the next upcoming future date.
       if (!entry) return;
 
       try {
-        // ✅ SERVER OWNS "WHAT DATE IS THAT?"
+        // deterministic answer for "what date is that?"
         if (asksWhatDate(userSpeech)) {
-          const lastDate = lastResolvedDateStore.get(callSid);
-          if (lastDate) {
-            const prettyDate = formatTorontoDateOnly(lastDate) || lastDate;
+          const remembered = lastResolvedDateStore.get(callSid) || getDraft(callSid).date;
+          if (remembered) {
+            const prettyDate = formatTorontoDateOnly(remembered) || remembered;
             const line = `That would be ${prettyDate}.`;
             const audio = await ttsWithRetry(line);
             const id = uuidv4();
@@ -605,6 +787,8 @@ If no year is specified, assume the next upcoming future date.
 
             pendingBookings.delete(callSid);
             conversationStore.delete(callSid);
+            bookingDraftStore.delete(callSid);
+            awaitingPhoneConfirm.delete(callSid);
             lastResolvedDateStore.delete(callSid);
             return;
           } catch (err) {
@@ -666,7 +850,10 @@ If no year is specified, assume the next upcoming future date.
             });
             awaitingPhoneConfirm.delete(callSid);
 
-            const line = `Perfect — I’ve got ${speakDigits(pendingPhone)}. What service would you like to book?`;
+            const nextQuestion = getNextMissingQuestion(getDraft(callSid));
+            const line = nextQuestion
+              ? `Perfect — I’ve got ${speakDigits(pendingPhone)}. ${nextQuestion}`
+              : `Perfect — I’ve got ${speakDigits(pendingPhone)}.`;
             const audio = await ttsWithRetry(line);
             const id = uuidv4();
             audioStore.set(id, audio);
@@ -695,6 +882,7 @@ If no year is specified, assume the next upcoming future date.
             return;
           }
 
+          // unclear response: ask again
           const line = `Just to confirm — is your number ${speakDigits(pendingPhone)}?`;
           const audio = await ttsWithRetry(line);
           const id = uuidv4();
@@ -709,7 +897,7 @@ If no year is specified, assume the next upcoming future date.
         }
 
         // B) If caller just said a full phone number this turn -> ask for confirmation
-        if (maybePhone.length === 10) {
+        if (maybePhone.length === 10 && !getDraft(callSid).phone) {
           awaitingPhoneConfirm.set(callSid, maybePhone);
 
           const line = `Just to confirm — is your number ${speakDigits(maybePhone)}?`;
@@ -731,6 +919,12 @@ If no year is specified, assume the next upcoming future date.
           role: "system",
           content: `${draftSummarySystem(draft)} Do NOT ask for fields already known. Ask ONLY for the next missing field.`,
         });
+        if (finalResolvedISO) {
+          messages.push({
+            role: "system",
+            content: `Server-resolved datetime for this turn is ${finalResolvedISO} (${BOT_TZ}). Use this exact value.`,
+          });
+        }
 
         let reply = "Sorry—could you say that again?";
 
@@ -755,7 +949,30 @@ If no year is specified, assume the next upcoming future date.
           console.log("❌ OpenAI error", e?.response?.status, e?.response?.data || e?.message);
         }
 
-        const action = extractAction(reply);
+        let action = extractAction(reply);
+        if (action?.action === "book") {
+          action = mergeBookActionWithDraft(action, getDraft(callSid));
+
+          const patchFromAction = {};
+          if (action.service) patchFromAction.service = action.service;
+          if (action.stylist) patchFromAction.stylist = action.stylist;
+          if (action.name) patchFromAction.name = action.name;
+          if (action.phone) patchFromAction.phone = normalizePhone(action.phone) || action.phone;
+          if (action.datetime) {
+            patchFromAction.datetime = action.datetime;
+            const adt = DateTime.fromISO(action.datetime, { zone: BOT_TZ });
+            if (adt.isValid) {
+              const d = adt.toFormat("yyyy-LL-dd");
+              patchFromAction.date = d;
+              lastResolvedDateStore.set(callSid, d);
+            }
+          }
+          if (Object.keys(patchFromAction).length) setDraft(callSid, patchFromAction);
+        } else {
+          const fromDraft = draftToBookAction(getDraft(callSid));
+          if (fromDraft) action = fromDraft;
+        }
+
         console.log("AI RAW REPLY:", reply);
         console.log("PARSED ACTION:", action);
 
@@ -773,6 +990,8 @@ If no year is specified, assume the next upcoming future date.
 
           pendingBookings.delete(callSid);
           conversationStore.delete(callSid);
+          bookingDraftStore.delete(callSid);
+          awaitingPhoneConfirm.delete(callSid);
           lastResolvedDateStore.delete(callSid);
           return;
         }
@@ -781,12 +1000,19 @@ If no year is specified, assume the next upcoming future date.
         spoken = sanitizeSpoken(spoken);
 
         if (action?.action === "book" && !isCompleteBooking(action)) {
-          spoken = "Quick check — what’s the best phone number to confirm the booking?";
+          spoken = getNextMissingQuestion(getDraft(callSid)) || "What detail should I update for the booking?";
         }
 
         if (isCompleteBooking(action)) {
           action.phone = normalizePhone(action.phone) || action.phone;
           action._createdAt = Date.now();
+          setDraft(callSid, {
+            service: action.service,
+            stylist: action.stylist,
+            datetime: action.datetime,
+            name: action.name,
+            phone: action.phone,
+          });
           pendingBookings.set(callSid, action);
 
           const pretty = formatTorontoConfirm(action.datetime) || action.datetime;
