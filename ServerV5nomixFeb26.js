@@ -211,7 +211,10 @@ function extractTimeOnly(text) {
   if (/\d{3,}/.test(t)) return null;
   if (DATE_WORD_RE.test(t)) return null;
 
-  const allow = new Set(["at", "around", "for", "please", "pls", "ok", "okay", "works", "work", "that", "sounds", "good"]);
+  const allow = new Set([
+    "at", "around", "for", "please", "pls", "ok", "okay", "works", "work", "that", "sounds", "good",
+    "yes", "yeah", "yep", "yup", "ya", "y", "no", "nah", "nope", "um", "uh", "thanks", "thank", "you",
+  ]);
   const leftoversAllowed = (leftovers) =>
     !leftovers || leftovers.split(/\s+/).every((w) => allow.has(w));
 
@@ -264,10 +267,28 @@ function isoToDateOnly(iso) {
   return dt.isValid ? dt.toFormat("yyyy-LL-dd") : null;
 }
 
+function isoToTimeOnly(iso) {
+  const dt = DateTime.fromISO(String(iso || ""), { zone: BOT_TZ });
+  if (!dt.isValid) return null;
+  return { hour: dt.hour, minute: dt.minute };
+}
+
 function detectWeekday(text) {
   const t = cleanSpeech(text);
   const hit = WEEKDAY_ALIASES.find((d) => d.re.test(t));
   return hit ? hit.weekday : null;
+}
+
+function hasForwardWeekdayIntent(text) {
+  const t = cleanSpeech(text);
+  if (!detectWeekday(t)) return false;
+  return (
+    /\bnext\b/.test(t) ||
+    /\bfollowing\b/.test(t) ||
+    /\bweek after\b/.test(t) ||
+    /\bafter that\b/.test(t) ||
+    /\bone after\b/.test(t)
+  );
 }
 
 function resolveRelativeDayISO(text) {
@@ -698,7 +719,7 @@ app.post("/voice/turn", async (req, res) => {
     const draftAtTurnStart = getDraft(callSid);
     const pendingAtTurnStart = pendingBookings.get(callSid);
     const t = cleanSpeech(userSpeech);
-    const hasExplicitNextWeekday = /\bnext\b/.test(t) && Boolean(detectWeekday(t));
+    const hasExplicitNextWeekday = hasForwardWeekdayIntent(t);
     const contextDateForWeekday =
       hasExplicitNextWeekday
         ? (draftAtTurnStart.date || isoToDateOnly(pendingAtTurnStart?.datetime))
@@ -742,6 +763,14 @@ If no year is specified, assume the next upcoming future date.
       const timeOnly = extractTimeOnly(userSpeech);
       if (draft?.date && timeOnly) {
         finalResolvedISO = buildISOFromDateAndTime(draft.date, timeOnly);
+      }
+    }
+
+    // If caller corrected only the date (e.g., "no, next Tuesday"), keep existing time.
+    if (!finalResolvedISO && foundDateOnly) {
+      const existingTime = isoToTimeOnly(draftAtTurnStart.datetime || pendingAtTurnStart?.datetime);
+      if (existingTime) {
+        finalResolvedISO = buildISOFromDateAndTime(foundDateOnly, existingTime);
       }
     }
 
@@ -847,6 +876,38 @@ If no year is specified, assume the next upcoming future date.
 
         if (pendingBooking && isNo(userSpeech)) {
           pendingBookings.delete(callSid);
+          const draftNow = getDraft(callSid);
+          const corrected = {
+            ...pendingBooking,
+            service: draftNow.service || pendingBooking.service,
+            stylist: draftNow.stylist || pendingBooking.stylist,
+            datetime: draftNow.datetime || pendingBooking.datetime,
+            name: draftNow.name || pendingBooking.name,
+            phone: draftNow.phone || pendingBooking.phone,
+          };
+
+          const changed =
+            corrected.service !== pendingBooking.service ||
+            corrected.stylist !== pendingBooking.stylist ||
+            corrected.datetime !== pendingBooking.datetime;
+
+          if (changed && corrected.datetime) {
+            corrected._createdAt = Date.now();
+            pendingBookings.set(callSid, corrected);
+
+            const pretty = formatTorontoConfirm(corrected.datetime) || corrected.datetime;
+            const line = `Got it — updating that to ${pretty}. Is that correct?`;
+            const audio = await ttsWithRetry(line);
+            const id = uuidv4();
+            audioStore.set(id, audio);
+
+            entry.ready = true;
+            entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+</Response>`;
+            return;
+          }
 
           const line = "No problem — what should I change? The day, the time, or the stylist?";
           const audio = await ttsWithRetry(line);
