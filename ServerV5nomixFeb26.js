@@ -7,6 +7,10 @@ import https from "https";
 import { v4 as uuidv4 } from "uuid";
 import "dotenv/config";
 
+// ✅ NEW: date parsing add-on
+import * as chrono from "chrono-node";
+import { DateTime } from "luxon";
+
 const app = express();
 
 // Twilio sends x-www-form-urlencoded by default
@@ -19,6 +23,9 @@ app.use("/assets", express.static("assets"));
  * https://hairhunters-voicebot.onrender.com
  */
 const BASE_URL = process.env.BASE_URL || "";
+
+// ✅ NEW: timezone config (set BOT_TIMEZONE in Render if you want)
+const BOT_TZ = process.env.BOT_TIMEZONE || "America/Toronto";
 
 // In-memory stores (OK for MVP; use Redis/S3 for production)
 const audioStore = new Map();            // id -> Buffer(mp3)
@@ -154,119 +161,50 @@ async function warmFillers() {
 }
 
 // ---------- HELPERS (DATE RESOLVER) ----------
-function getTZParts(date, timeZone = "America/Toronto") {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  }).formatToParts(date);
-
-  const map = {};
-  for (const p of parts) if (p.type !== "literal") map[p.type] = p.value;
-
-  return {
-    y: Number(map.year),
-    m: Number(map.month),
-    d: Number(map.day),
-    hh: Number(map.hour),
-    mm: Number(map.minute),
-    ss: Number(map.second),
-  };
-}
-
-function zonedWallTimeToInstant({ y, m, d, hh, mm, ss }, timeZone = "America/Toronto") {
-  const desiredUTC = Date.UTC(y, m - 1, d, hh, mm, ss);
-  let guess = new Date(desiredUTC);
-  for (let i = 0; i < 3; i++) {
-    const got = getTZParts(guess, timeZone);
-    const gotUTC = Date.UTC(got.y, got.m - 1, got.d, got.hh, got.mm, got.ss);
-    guess = new Date(guess.getTime() + (desiredUTC - gotUTC));
-  }
-  return guess;
-}
-
-function formatISOWithTZOffset(date, timeZone = "America/Toronto") {
-  const p = getTZParts(date, timeZone);
-  const isoLocal = `${String(p.y).padStart(4, "0")}-${String(p.m).padStart(2, "0")}-${String(p.d).padStart(2, "0")}T${String(p.hh).padStart(2, "0")}:${String(p.mm).padStart(2, "0")}:${String(p.ss).padStart(2, "0")}`;
-
-  const asUTC = new Date(Date.UTC(p.y, p.m - 1, p.d, p.hh, p.mm, p.ss));
-  const offsetMin = Math.round((date.getTime() - asUTC.getTime()) / 60000);
-
-  const sign = offsetMin <= 0 ? "-" : "+";
-  const abs = Math.abs(offsetMin);
-  const oh = String(Math.floor(abs / 60)).padStart(2, "0");
-  const om = String(abs % 60).padStart(2, "0");
-
-  return `${isoLocal}${sign}${oh}:${om}`;
-}
-
-function getWeekdayIndexInTZ(date, timeZone = "America/Toronto") {
-  const wd = new Intl.DateTimeFormat("en-CA", { timeZone, weekday: "long" })
-    .format(date)
-    .toLowerCase();
-  const days = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"];
-  return days.indexOf(wd);
-}
-
+// ✅ REPLACED: this is now chrono + luxon and handles "next Tuesday", "tomorrow at 4", etc.
 function resolveDateToISO(text) {
-  const tz = "America/Toronto";
-  const lower = String(text || "").toLowerCase();
-  const days = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"];
+  const input = String(text || "").trim();
+  if (!input) return null;
 
-  const now = new Date();
-  const nowT = getTZParts(now, tz);
-  const nowInstant = zonedWallTimeToInstant({ ...nowT }, tz);
-  const todayIdx = getWeekdayIndexInTZ(nowInstant, tz);
+  const now = DateTime.now().setZone(BOT_TZ);
 
-  let targetIdx = -1;
-  for (let i = 0; i < days.length; i++) {
-    if (lower.includes(days[i])) { targetIdx = i; break; }
-  }
-  if (targetIdx === -1) return null;
+  const results = chrono.parse(input, now.toJSDate());
+  if (!results.length) return null;
 
-  let diff = targetIdx - todayIdx;
-  if (diff <= 0) diff += 7;
-  if (/\bnext\b/.test(lower)) diff += 7;
+  const r = results[0];
+  const kv = r?.start?.knownValues || {};
 
-  let hh = 12, mm = 0, ss = 0;
+  // Require at least some date info (weekday or month/day etc)
+  const hasDateInfo =
+    ("weekday" in kv) || ("day" in kv) || ("month" in kv) || ("year" in kv);
 
-  if (/\bnoon\b/.test(lower)) {
-    hh = 12; mm = 0;
-  } else if (/\bmidnight\b/.test(lower)) {
-    hh = 0; mm = 0;
-  } else {
-    const m = lower.match(/(?:\bat\b\s*)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b|(?:\bat\b\s*)(\d{1,2})(?::(\d{2}))?\b/);
-    if (!m) return null;
+  if (!hasDateInfo) return null;
 
-    const hourStr = m[1] || m[4];
-    const minStr  = m[2] || m[5] || "0";
-    const ampm    = m[3];
+  // Require time info (so we don't silently default to noon)
+  const hasTimeInfo =
+    ("hour" in kv) ||
+    ("minute" in kv) ||
+    /\b(noon|midnight)\b/i.test(input) ||
+    /\b(\d{1,2})(?::\d{2})?\s*(am|pm)?\b/i.test(input);
 
-    hh = parseInt(hourStr, 10);
-    mm = parseInt(minStr, 10);
+  if (!hasTimeInfo) return null;
 
-    if (ampm) {
-      if (ampm === "pm" && hh !== 12) hh += 12;
-      if (ampm === "am" && hh === 12) hh = 0;
-    } else {
-      if (hh >= 1 && hh <= 7) hh += 12;
+  let dt = DateTime.fromJSDate(r.start.date()).setZone(BOT_TZ);
+
+  // Never book in the past (best-effort bump if year wasn't explicitly said)
+  const specifiedYear = ("year" in kv);
+  const specifiedMonthDay = ("month" in kv) && ("day" in kv);
+  const specifiedWeekdayOnly = ("weekday" in kv) && !("month" in kv) && !("day" in kv);
+
+  if (dt < now) {
+    if (!specifiedYear) {
+      if (specifiedWeekdayOnly) dt = dt.plus({ days: 7 });
+      else if (specifiedMonthDay) dt = dt.plus({ years: 1 });
     }
   }
 
-  const targetBase = new Date(nowInstant.getTime() + diff * 24 * 60 * 60 * 1000);
-  const baseParts = getTZParts(targetBase, tz);
-
-  const targetInstant = zonedWallTimeToInstant(
-    { y: baseParts.y, m: baseParts.m, d: baseParts.d, hh, mm, ss },
-    tz
-  );
-
-  return formatISOWithTZOffset(targetInstant, tz);
+  // Return ISO with offset, no milliseconds
+  return dt.toISO({ suppressMilliseconds: true, includeOffset: true });
 }
 
 function extractAction(text) {
@@ -284,18 +222,18 @@ function formatTorontoConfirm(iso) {
   if (isNaN(d.getTime())) return null;
 
   const weekday = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/Toronto",
+    timeZone: BOT_TZ,
     weekday: "long",
   }).format(d);
 
   const datePretty = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/Toronto",
+    timeZone: BOT_TZ,
     month: "long",
     day: "numeric",
   }).format(d);
 
   const timePretty = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/Toronto",
+    timeZone: BOT_TZ,
     hour: "numeric",
     minute: "numeric",
     hour12: true,
@@ -305,7 +243,7 @@ function formatTorontoConfirm(iso) {
 }
 
 function torontoNowString() {
-  return new Date().toLocaleString("en-CA", { timeZone: "America/Toronto" });
+  return new Date().toLocaleString("en-CA", { timeZone: BOT_TZ });
 }
 
 function isCompleteBooking(action) {
@@ -515,7 +453,6 @@ app.post("/voice/turn", async (req, res) => {
   try {
     const callSid = req.body.CallSid || "no-callsid";
     const userSpeech = req.body.SpeechResult || "";
-    
 
     if (!conversationStore.has(callSid)) {
       conversationStore.set(callSid, [
@@ -526,7 +463,7 @@ app.post("/voice/turn", async (req, res) => {
             `
 
 CURRENT_DATETIME_TORONTO: ${torontoNowString()}
-Timezone: America/Toronto
+Timezone: ${BOT_TZ}
 Never book in the past.
 If no year is specified, assume the next upcoming future date.
 `,
@@ -535,7 +472,8 @@ If no year is specified, assume the next upcoming future date.
     }
 
     const messages = conversationStore.get(callSid);
-    
+
+    // ✅ chrono/luxon resolution
     const resolvedISO = resolveDateToISO(userSpeech);
 
     if (resolvedISO) {
@@ -630,88 +568,88 @@ If no year is specified, assume the next upcoming future date.
         }
 
         // ---- PHONE CONFIRM FLOW (server-controlled) ----
-const maybePhone = extractLikelyPhoneFromSpeech(userSpeech);
+        const maybePhone = extractLikelyPhoneFromSpeech(userSpeech);
 
-// A) If we are waiting on "yes/no" to confirm phone
-if (awaitingPhoneConfirm.has(callSid)) {
-  const pendingPhone = awaitingPhoneConfirm.get(callSid);
+        // A) If we are waiting on "yes/no" to confirm phone
+        if (awaitingPhoneConfirm.has(callSid)) {
+          const pendingPhone = awaitingPhoneConfirm.get(callSid);
 
-  if (isYes(userSpeech)) {
-    // lock phone into draft
-    setDraft(callSid, { phone: pendingPhone });
-    messages.push({
-  role: "system",
-  content: `Caller phone confirmed: ${pendingPhone}. Do NOT ask for phone again.`,
-});
-    awaitingPhoneConfirm.delete(callSid);
+          if (isYes(userSpeech)) {
+            // lock phone into draft
+            setDraft(callSid, { phone: pendingPhone });
+            messages.push({
+              role: "system",
+              content: `Caller phone confirmed: ${pendingPhone}. Do NOT ask for phone again.`,
+            });
+            awaitingPhoneConfirm.delete(callSid);
 
-    const line = `Perfect — I’ve got ${speakDigits(pendingPhone)}. What service would you like to book?`;
-    const audio = await ttsWithRetry(line);
-    const id = uuidv4();
-    audioStore.set(id, audio);
+            const line = `Perfect — I’ve got ${speakDigits(pendingPhone)}. What service would you like to book?`;
+            const audio = await ttsWithRetry(line);
+            const id = uuidv4();
+            audioStore.set(id, audio);
 
-    entry.ready = true;
-    entry.twiml = `<Response>
+            entry.ready = true;
+            entry.twiml = `<Response>
   <Play>${host}/audio/${id}.mp3</Play>
   <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
 </Response>`;
-    return;
-  }
+            return;
+          }
 
-  if (isNo(userSpeech)) {
-    awaitingPhoneConfirm.delete(callSid);
+          if (isNo(userSpeech)) {
+            awaitingPhoneConfirm.delete(callSid);
 
-    const line = "No worries — can you say the full 10-digit phone number again, one digit at a time?";
-    const audio = await ttsWithRetry(line);
-    const id = uuidv4();
-    audioStore.set(id, audio);
+            const line = "No worries — can you say the full 10-digit phone number again, one digit at a time?";
+            const audio = await ttsWithRetry(line);
+            const id = uuidv4();
+            audioStore.set(id, audio);
 
-    entry.ready = true;
-    entry.twiml = `<Response>
+            entry.ready = true;
+            entry.twiml = `<Response>
   <Play>${host}/audio/${id}.mp3</Play>
   <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
 </Response>`;
-    return;
-  }
+            return;
+          }
 
-  // unclear response: ask again
-  const line = `Just to confirm — is your number ${speakDigits(pendingPhone)}?`;
-  const audio = await ttsWithRetry(line);
-  const id = uuidv4();
-  audioStore.set(id, audio);
+          // unclear response: ask again
+          const line = `Just to confirm — is your number ${speakDigits(pendingPhone)}?`;
+          const audio = await ttsWithRetry(line);
+          const id = uuidv4();
+          audioStore.set(id, audio);
 
-  entry.ready = true;
-  entry.twiml = `<Response>
+          entry.ready = true;
+          entry.twiml = `<Response>
   <Play>${host}/audio/${id}.mp3</Play>
   <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
 </Response>`;
-  return;
-}
+          return;
+        }
 
-// B) If caller just said a full phone number this turn -> ask for confirmation
-if (maybePhone.length === 10) {
-  awaitingPhoneConfirm.set(callSid, maybePhone);
+        // B) If caller just said a full phone number this turn -> ask for confirmation
+        if (maybePhone.length === 10) {
+          awaitingPhoneConfirm.set(callSid, maybePhone);
 
-  const line = `Just to confirm — is your number ${speakDigits(maybePhone)}?`;
-  const audio = await ttsWithRetry(line);
-  const id = uuidv4();
-  audioStore.set(id, audio);
+          const line = `Just to confirm — is your number ${speakDigits(maybePhone)}?`;
+          const audio = await ttsWithRetry(line);
+          const id = uuidv4();
+          audioStore.set(id, audio);
 
-  entry.ready = true;
-  entry.twiml = `<Response>
+          entry.ready = true;
+          entry.twiml = `<Response>
   <Play>${host}/audio/${id}.mp3</Play>
   <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
 </Response>`;
-  return;
-}
+          return;
+        }
 
-// Remind the model what we already collected (prevents re-asking)
-const draft = getDraft(callSid);
-messages.push({
-  role: "system",
-  content: `${draftSummarySystem(draft)} Do NOT ask for fields already known. Ask ONLY for the next missing field.`,
-});
-        
+        // Remind the model what we already collected (prevents re-asking)
+        const draft = getDraft(callSid);
+        messages.push({
+          role: "system",
+          content: `${draftSummarySystem(draft)} Do NOT ask for fields already known. Ask ONLY for the next missing field.`,
+        });
+
         let reply = "Sorry—could you say that again?";
 
         try {
@@ -739,7 +677,6 @@ messages.push({
         console.log("AI RAW REPLY:", reply);
         console.log("PARSED ACTION:", action);
 
-      
         if (action?.action === "transfer" && process.env.SALON_PHONE && wantsHuman(userSpeech)) {
           const transferLine = "Okay, I’ll connect you to the salon now.";
           const audio = await ttsWithRetry(transferLine);
@@ -905,6 +842,7 @@ app.get("/env-check", (_, res) => {
     repeatClip: clipIds.repeat ? "ready" : "missing",
     pendingTurns: pendingTurns.size,
     pendingBookings: pendingBookings.size,
+    BOT_TIMEZONE: BOT_TZ,
   });
 });
 
