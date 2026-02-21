@@ -7,7 +7,7 @@ import https from "https";
 import { v4 as uuidv4 } from "uuid";
 import "dotenv/config";
 
-// ✅ NEW: date parsing add-on
+// ✅ date parsing add-on
 import * as chrono from "chrono-node";
 import { DateTime } from "luxon";
 
@@ -24,7 +24,7 @@ app.use("/assets", express.static("assets"));
  */
 const BASE_URL = process.env.BASE_URL || "";
 
-// ✅ NEW: timezone config (set BOT_TIMEZONE in Render if you want)
+// timezone config
 const BOT_TZ = process.env.BOT_TIMEZONE || "America/Toronto";
 
 // In-memory stores (OK for MVP; use Redis/S3 for production)
@@ -32,6 +32,9 @@ const audioStore = new Map();            // id -> Buffer(mp3)
 const conversationStore = new Map();     // callSid -> messages[]
 const pendingTurns = new Map();          // token -> { ready, twiml, createdAt, fillerId }
 const pendingBookings = new Map();       // callSid -> booking payload waiting for confirm
+
+// ✅ NEW: remembers last resolved DATE (even without time) per call
+const lastResolvedDateStore = new Map(); // callSid -> "YYYY-MM-DD"
 
 // Keep-alive HTTP client (reduces latency)
 const httpsAgent = new https.Agent({ keepAlive: true });
@@ -68,6 +71,10 @@ Tasks:
 - When you say the time back to the caller to confirm, speak in natural language (NOT ISO).
 - Phone MUST be digits only (no spaces, no dashes, no words). Example: “9055551234”.
 - If the caller says “nine oh five…”, convert to digits.
+
+IMPORTANT:
+- Do NOT do calendar math or guess weekdays/dates. If the caller asks “what date is that?”, the server will answer.
+- If you only have a day (e.g., “next Tuesday”) but no time, ask for the time.
 
 - If caller asks for a human/manager/desk, respond with:
 ACTION_JSON: {"action":"transfer"}
@@ -106,7 +113,7 @@ async function tts(text) {
           Accept: "audio/mpeg",
         },
         responseType: "arraybuffer",
-        timeout: 8000, // keep tight for Twilio stability
+        timeout: 8000,
       }
     );
 
@@ -160,8 +167,71 @@ async function warmFillers() {
   }
 }
 
-// ---------- HELPERS (DATE RESOLVER) ----------
-// ✅ REPLACED: this is now chrono + luxon and handles "next Tuesday", "tomorrow at 4", etc.
+// ---------- HELPERS ----------
+
+function cleanSpeech(text) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function asksWhatDate(text) {
+  const t = cleanSpeech(text);
+  return /\b(what date|which date|what day is that|what day would that be|what day is it|what date would that be)\b/.test(t);
+}
+
+// ✅ DATE-ONLY resolver: "next Tuesday" -> "YYYY-MM-DD"
+function resolveDateOnlyISO(text) {
+  const input = String(text || "").trim();
+  if (!input) return null;
+
+  const now = DateTime.now().setZone(BOT_TZ);
+  const results = chrono.parse(input, now.toJSDate());
+  if (!results.length) return null;
+
+  const r = results[0];
+  const kv = r?.start?.knownValues || {};
+
+  const hasDateInfo =
+    ("weekday" in kv) || ("day" in kv) || ("month" in kv) || ("year" in kv);
+  if (!hasDateInfo) return null;
+
+  let dt = DateTime.fromJSDate(r.start.date()).setZone(BOT_TZ);
+
+  // If no year specified and it resolved into the past, bump forward
+  const specifiedYear = ("year" in kv);
+  if (!specifiedYear && dt < now.startOf("day")) {
+    const weekdayOnly = ("weekday" in kv) && !("month" in kv) && !("day" in kv);
+    const monthDay = ("month" in kv) && ("day" in kv);
+    if (weekdayOnly) dt = dt.plus({ days: 7 });
+    else if (monthDay) dt = dt.plus({ years: 1 });
+  }
+
+  return dt.toFormat("yyyy-LL-dd");
+}
+
+function formatTorontoDateOnly(dateISO) {
+  // Use noon to avoid timezone edges
+  const d = new Date(`${dateISO}T12:00:00`);
+  if (isNaN(d.getTime())) return null;
+
+  const weekday = new Intl.DateTimeFormat("en-CA", {
+    timeZone: BOT_TZ,
+    weekday: "long",
+  }).format(d);
+
+  const datePretty = new Intl.DateTimeFormat("en-CA", {
+    timeZone: BOT_TZ,
+    month: "long",
+    day: "numeric",
+  }).format(d);
+
+  return `${weekday}, ${datePretty}`;
+}
+
+// ✅ DATE+TIME resolver: only returns when time exists
 function resolveDateToISO(text) {
   const input = String(text || "").trim();
   if (!input) return null;
@@ -174,13 +244,11 @@ function resolveDateToISO(text) {
   const r = results[0];
   const kv = r?.start?.knownValues || {};
 
-  // Require at least some date info (weekday or month/day etc)
   const hasDateInfo =
     ("weekday" in kv) || ("day" in kv) || ("month" in kv) || ("year" in kv);
-
   if (!hasDateInfo) return null;
 
-  // Require time info (so we don't silently default to noon)
+  // Require time info so we don't default to noon
   const hasTimeInfo =
     ("hour" in kv) ||
     ("minute" in kv) ||
@@ -203,7 +271,6 @@ function resolveDateToISO(text) {
     }
   }
 
-  // Return ISO with offset, no milliseconds
   return dt.toISO({ suppressMilliseconds: true, includeOffset: true });
 }
 
@@ -265,14 +332,6 @@ function normalizePhone(s) {
   return digits;
 }
 
-function cleanSpeech(text) {
-  return String(text || "")
-    .toLowerCase()
-    .replace(/[^\w\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
 function isYes(text) {
   const t = cleanSpeech(text);
   if (/\b(no|nope|nah|negative|not|dont|do not)\b/.test(t)) return false;
@@ -313,7 +372,6 @@ async function postBookingToZapier(payload) {
   if (resp.status < 200 || resp.status >= 300) throw new Error(`Zapier returned ${resp.status}`);
 }
 
-
 // Cleanup so memory doesn't grow forever
 setInterval(() => {
   if (audioStore.size > 300) {
@@ -328,6 +386,13 @@ setInterval(() => {
 
   for (const [sid, v] of pendingBookings.entries()) {
     if (now - (v._createdAt || now) > 600_000) pendingBookings.delete(sid);
+  }
+
+  // ✅ also clean date-only memory
+  for (const [sid, date] of lastResolvedDateStore.entries()) {
+    void date;
+    // best-effort: if the convo is gone, drop it too
+    if (!conversationStore.has(sid)) lastResolvedDateStore.delete(sid);
   }
 }, 30_000);
 
@@ -369,13 +434,8 @@ function extractLikelyPhoneFromSpeech(speech) {
   // keep only digits
   const digits = t.replace(/\D/g, "");
 
-  // prefer a clean 10-digit number if present anywhere
   if (digits.length === 10) return digits;
-
-  // if longer, take last 10 (handles “+1 905...” etc)
   if (digits.length > 10) return digits.slice(-10);
-
-  // if shorter, return as-is (caller may be mid-number)
   return digits;
 }
 
@@ -454,6 +514,10 @@ app.post("/voice/turn", async (req, res) => {
     const callSid = req.body.CallSid || "no-callsid";
     const userSpeech = req.body.SpeechResult || "";
 
+    // ✅ store date-only resolution every turn (even without time)
+    const resolvedDateOnly = resolveDateOnlyISO(userSpeech);
+    if (resolvedDateOnly) lastResolvedDateStore.set(callSid, resolvedDateOnly);
+
     if (!conversationStore.has(callSid)) {
       conversationStore.set(callSid, [
         {
@@ -473,7 +537,7 @@ If no year is specified, assume the next upcoming future date.
 
     const messages = conversationStore.get(callSid);
 
-    // ✅ chrono/luxon resolution
+    // date+time resolution (only when time exists)
     const resolvedISO = resolveDateToISO(userSpeech);
 
     if (resolvedISO) {
@@ -500,6 +564,25 @@ If no year is specified, assume the next upcoming future date.
       if (!entry) return;
 
       try {
+        // ✅ SERVER OWNS "WHAT DATE IS THAT?"
+        if (asksWhatDate(userSpeech)) {
+          const lastDate = lastResolvedDateStore.get(callSid);
+          if (lastDate) {
+            const prettyDate = formatTorontoDateOnly(lastDate) || lastDate;
+            const line = `That would be ${prettyDate}.`;
+            const audio = await ttsWithRetry(line);
+            const id = uuidv4();
+            audioStore.set(id, audio);
+
+            entry.ready = true;
+            entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+</Response>`;
+            return;
+          }
+        }
+
         const pendingBooking = pendingBookings.get(callSid);
 
         if (pendingBooking && isYes(userSpeech)) {
@@ -522,6 +605,7 @@ If no year is specified, assume the next upcoming future date.
 
             pendingBookings.delete(callSid);
             conversationStore.delete(callSid);
+            lastResolvedDateStore.delete(callSid);
             return;
           } catch (err) {
             console.log("❌ Booking post failed, NOT hanging up:", err?.message || err);
@@ -575,7 +659,6 @@ If no year is specified, assume the next upcoming future date.
           const pendingPhone = awaitingPhoneConfirm.get(callSid);
 
           if (isYes(userSpeech)) {
-            // lock phone into draft
             setDraft(callSid, { phone: pendingPhone });
             messages.push({
               role: "system",
@@ -612,7 +695,6 @@ If no year is specified, assume the next upcoming future date.
             return;
           }
 
-          // unclear response: ask again
           const line = `Just to confirm — is your number ${speakDigits(pendingPhone)}?`;
           const audio = await ttsWithRetry(line);
           const id = uuidv4();
@@ -691,6 +773,7 @@ If no year is specified, assume the next upcoming future date.
 
           pendingBookings.delete(callSid);
           conversationStore.delete(callSid);
+          lastResolvedDateStore.delete(callSid);
           return;
         }
 
