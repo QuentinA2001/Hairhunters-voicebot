@@ -259,6 +259,11 @@ function extractTimeFromSpeech(text) {
   return extractTimeOnly(input);
 }
 
+function isoToDateOnly(iso) {
+  const dt = DateTime.fromISO(String(iso || ""), { zone: BOT_TZ });
+  return dt.isValid ? dt.toFormat("yyyy-LL-dd") : null;
+}
+
 function detectWeekday(text) {
   const t = cleanSpeech(text);
   const hit = WEEKDAY_ALIASES.find((d) => d.re.test(t));
@@ -274,7 +279,7 @@ function resolveRelativeDayISO(text) {
   return null;
 }
 
-function resolveUpcomingWeekdayISO(text) {
+function resolveUpcomingWeekdayISO(text, opts = {}) {
   const t = cleanSpeech(text);
   const weekday = detectWeekday(t);
   if (!weekday) return null;
@@ -283,17 +288,30 @@ function resolveUpcomingWeekdayISO(text) {
   let daysAhead = (weekday - now.weekday + 7) % 7;
   const explicitThis = /\b(this|coming)\b/.test(t);
   if (daysAhead === 0 && !explicitThis) daysAhead = 7;
-  return now.plus({ days: daysAhead }).toFormat("yyyy-LL-dd");
+
+  let candidate = now.plus({ days: daysAhead });
+  const afterDateISO = opts?.afterDateISO || null;
+  const afterDate = afterDateISO
+    ? DateTime.fromISO(`${afterDateISO}T00:00:00`, { zone: BOT_TZ }).startOf("day")
+    : null;
+
+  // If caller says "next Tuesday" while already discussing a Tuesday date,
+  // move to the following week relative to that existing date.
+  if (afterDate && afterDate.isValid) {
+    while (candidate <= afterDate) candidate = candidate.plus({ days: 7 });
+  }
+
+  return candidate.toFormat("yyyy-LL-dd");
 }
 
-function resolveDateOnlyISO(text) {
+function resolveDateOnlyISO(text, opts = {}) {
   const input = String(text || "").trim();
   if (!input) return null;
 
   const relative = resolveRelativeDayISO(input);
   if (relative) return relative;
 
-  const weekdayDate = resolveUpcomingWeekdayISO(input);
+  const weekdayDate = resolveUpcomingWeekdayISO(input, opts);
   if (weekdayDate) return weekdayDate;
 
   const now = DateTime.now().setZone(BOT_TZ);
@@ -324,12 +342,12 @@ function buildISOFromDateAndTime(dateISO, timeObj) {
   return dt.isValid ? dt.toISO({ suppressMilliseconds: true, includeOffset: true }) : null;
 }
 
-function resolveDateToISO(text) {
+function resolveDateToISO(text, opts = {}) {
   const input = String(text || "").trim();
   if (!input) return null;
 
   const now = DateTime.now().setZone(BOT_TZ);
-  const dateISO = resolveDateOnlyISO(input);
+  const dateISO = resolveDateOnlyISO(input, opts);
   if (!dateISO) return null;
 
   const timeObj = extractTimeFromSpeech(input);
@@ -467,6 +485,16 @@ function sanitizeSpoken(text) {
   );
   out = out.replace(/\b\d{4}-\d{2}-\d{2}\b/g, "that date");
   return out;
+}
+
+function assistantSeemsToAskForTime(text) {
+  const t = cleanSpeech(text);
+  return (
+    /\b(what|which)\s+time\b/.test(t) ||
+    /\bwhat\s+hour\b/.test(t) ||
+    /\btime\s+(works|would work|is good|is best)\b/.test(t) ||
+    /\bcan you give me a time\b/.test(t)
+  );
 }
 
 function getNextMissingQuestion(draft) {
@@ -667,9 +695,17 @@ app.post("/voice/turn", async (req, res) => {
   try {
     const callSid = req.body.CallSid || "no-callsid";
     const userSpeech = req.body.SpeechResult || "";
+    const draftAtTurnStart = getDraft(callSid);
+    const pendingAtTurnStart = pendingBookings.get(callSid);
+    const t = cleanSpeech(userSpeech);
+    const hasExplicitNextWeekday = /\bnext\b/.test(t) && Boolean(detectWeekday(t));
+    const contextDateForWeekday =
+      hasExplicitNextWeekday
+        ? (draftAtTurnStart.date || isoToDateOnly(pendingAtTurnStart?.datetime))
+        : null;
 
     // Server-owned slot extraction on every utterance
-    let foundDateOnly = resolveDateOnlyISO(userSpeech);
+    let foundDateOnly = resolveDateOnlyISO(userSpeech, { afterDateISO: contextDateForWeekday });
     const speechPatch = {};
     const foundStylist = extractStylistFromSpeech(userSpeech);
     const foundService = extractServiceFromSpeech(userSpeech);
@@ -699,7 +735,7 @@ If no year is specified, assume the next upcoming future date.
     }
 
     const messages = conversationStore.get(callSid);
-    let finalResolvedISO = resolveDateToISO(userSpeech);
+    let finalResolvedISO = resolveDateToISO(userSpeech, { afterDateISO: contextDateForWeekday });
 
     if (!finalResolvedISO) {
       const draft = getDraft(callSid);
@@ -924,6 +960,10 @@ If no year is specified, assume the next upcoming future date.
             role: "system",
             content: `Server-resolved datetime for this turn is ${finalResolvedISO} (${BOT_TZ}). Use this exact value.`,
           });
+          messages.push({
+            role: "system",
+            content: `Datetime is already known for this booking. Do NOT ask for time again.`,
+          });
         }
 
         let reply = "Sorry—could you say that again?";
@@ -998,6 +1038,10 @@ If no year is specified, assume the next upcoming future date.
 
         let spoken = reply.replace(/ACTION_JSON:[\s\S]*$/, "").trim() || "Got it.";
         spoken = sanitizeSpoken(spoken);
+        const latestDraft = getDraft(callSid);
+        if (latestDraft.datetime && assistantSeemsToAskForTime(spoken)) {
+          spoken = getNextMissingQuestion(latestDraft) || "Great. What’s your name for the booking?";
+        }
 
         if (action?.action === "book" && !isCompleteBooking(action)) {
           spoken = getNextMissingQuestion(getDraft(callSid)) || "What detail should I update for the booking?";
