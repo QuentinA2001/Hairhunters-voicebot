@@ -291,6 +291,17 @@ function hasForwardWeekdayIntent(text) {
   );
 }
 
+function hasNextWeekOnlyIntent(text) {
+  const t = cleanSpeech(text);
+  if (detectWeekday(t)) return false;
+  return (
+    /\bnext week\b/.test(t) ||
+    /\bfollowing week\b/.test(t) ||
+    /\bweek after\b/.test(t) ||
+    /\bthe week after\b/.test(t)
+  );
+}
+
 function resolveRelativeDayISO(text) {
   const t = cleanSpeech(text);
   const now = DateTime.now().setZone(BOT_TZ).startOf("day");
@@ -328,6 +339,12 @@ function resolveUpcomingWeekdayISO(text, opts = {}) {
 function resolveDateOnlyISO(text, opts = {}) {
   const input = String(text || "").trim();
   if (!input) return null;
+
+  // "next week" should keep same weekday from current booking context.
+  if (hasNextWeekOnlyIntent(input) && opts?.afterDateISO) {
+    const base = DateTime.fromISO(`${opts.afterDateISO}T00:00:00`, { zone: BOT_TZ }).startOf("day");
+    if (base.isValid) return base.plus({ days: 7 }).toFormat("yyyy-LL-dd");
+  }
 
   const relative = resolveRelativeDayISO(input);
   if (relative) return relative;
@@ -719,14 +736,14 @@ app.post("/voice/turn", async (req, res) => {
     const draftAtTurnStart = getDraft(callSid);
     const pendingAtTurnStart = pendingBookings.get(callSid);
     const t = cleanSpeech(userSpeech);
-    const hasExplicitNextWeekday = hasForwardWeekdayIntent(t);
-    const contextDateForWeekday =
-      hasExplicitNextWeekday
+    const hasForwardDateIntent = hasForwardWeekdayIntent(t) || hasNextWeekOnlyIntent(t);
+    const contextDateForCorrection =
+      hasForwardDateIntent
         ? (draftAtTurnStart.date || isoToDateOnly(pendingAtTurnStart?.datetime))
         : null;
 
     // Server-owned slot extraction on every utterance
-    let foundDateOnly = resolveDateOnlyISO(userSpeech, { afterDateISO: contextDateForWeekday });
+    let foundDateOnly = resolveDateOnlyISO(userSpeech, { afterDateISO: contextDateForCorrection });
     const speechPatch = {};
     const foundStylist = extractStylistFromSpeech(userSpeech);
     const foundService = extractServiceFromSpeech(userSpeech);
@@ -756,7 +773,7 @@ If no year is specified, assume the next upcoming future date.
     }
 
     const messages = conversationStore.get(callSid);
-    let finalResolvedISO = resolveDateToISO(userSpeech, { afterDateISO: contextDateForWeekday });
+    let finalResolvedISO = resolveDateToISO(userSpeech, { afterDateISO: contextDateForCorrection });
 
     if (!finalResolvedISO) {
       const draft = getDraft(callSid);
@@ -875,7 +892,6 @@ If no year is specified, assume the next upcoming future date.
         }
 
         if (pendingBooking && isNo(userSpeech)) {
-          pendingBookings.delete(callSid);
           const draftNow = getDraft(callSid);
           const corrected = {
             ...pendingBooking,
@@ -894,6 +910,14 @@ If no year is specified, assume the next upcoming future date.
           if (changed && corrected.datetime) {
             corrected._createdAt = Date.now();
             pendingBookings.set(callSid, corrected);
+            setDraft(callSid, {
+              service: corrected.service,
+              stylist: corrected.stylist,
+              datetime: corrected.datetime,
+              name: corrected.name,
+              phone: corrected.phone,
+              date: isoToDateOnly(corrected.datetime) || draftNow.date,
+            });
 
             const pretty = formatTorontoConfirm(corrected.datetime) || corrected.datetime;
             const line = `Got it — updating that to ${pretty}. Is that correct?`;
@@ -923,13 +947,52 @@ If no year is specified, assume the next upcoming future date.
         }
 
         if (pendingBooking && !isYes(userSpeech) && !isNo(userSpeech)) {
+          const draftNow = getDraft(callSid);
+          const corrected = {
+            ...pendingBooking,
+            service: draftNow.service || pendingBooking.service,
+            stylist: draftNow.stylist || pendingBooking.stylist,
+            datetime: draftNow.datetime || pendingBooking.datetime,
+            name: draftNow.name || pendingBooking.name,
+            phone: draftNow.phone || pendingBooking.phone,
+          };
+          const changed =
+            corrected.service !== pendingBooking.service ||
+            corrected.stylist !== pendingBooking.stylist ||
+            corrected.datetime !== pendingBooking.datetime;
+
+          if (changed && corrected.datetime) {
+            corrected._createdAt = Date.now();
+            pendingBookings.set(callSid, corrected);
+            setDraft(callSid, {
+              service: corrected.service,
+              stylist: corrected.stylist,
+              datetime: corrected.datetime,
+              name: corrected.name,
+              phone: corrected.phone,
+              date: isoToDateOnly(corrected.datetime) || draftNow.date,
+            });
+
+            const pretty = formatTorontoConfirm(corrected.datetime) || corrected.datetime;
+            const line = `Got it — updating that to ${pretty}. Is that correct?`;
+            const audio = await ttsWithRetry(line);
+            const id = uuidv4();
+            audioStore.set(id, audio);
+
+            entry.ready = true;
+            entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+</Response>`;
+            return;
+          }
+
           messages.push({
             role: "system",
             content:
               `The caller is correcting the appointment time. Keep service="${pendingBooking.service}", stylist="${pendingBooking.stylist}", name="${pendingBooking.name}", phone="${pendingBooking.phone}". ` +
               `Update ONLY datetime based on the caller's correction and output ACTION_JSON book with updated datetime.`,
           });
-          pendingBookings.delete(callSid);
         }
 
         // ---- PHONE CONFIRM FLOW (server-controlled) ----
