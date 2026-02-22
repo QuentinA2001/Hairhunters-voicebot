@@ -864,18 +864,56 @@ async function checkGoogleCalendarAvailability(booking) {
       },
     });
 
-    const busy = resp?.data?.calendars?.[cfg.calendarId]?.busy || [];
+    const calBlock = resp?.data?.calendars?.[cfg.calendarId];
+    const calErrors = Array.isArray(calBlock?.errors) ? calBlock.errors : [];
+    if (!calBlock) {
+      console.log("⚠️ Google Calendar freebusy missing calendar block", {
+        calendarId: cfg.calendarId,
+        keys: Object.keys(resp?.data?.calendars || {}),
+      });
+      return { enabled: true, available: false, reason: "calendar_missing" };
+    }
+    if (calErrors.length) {
+      console.log("⚠️ Google Calendar freebusy calendar errors", {
+        calendarId: cfg.calendarId,
+        errors: calErrors,
+      });
+      return { enabled: true, available: false, reason: "calendar_error" };
+    }
+
+    const busy = Array.isArray(calBlock?.busy) ? calBlock.busy : [];
+    console.log("📅 Calendar availability", {
+      calendarId: cfg.calendarId,
+      start: start.toISO(),
+      end: end.toISO(),
+      busyCount: busy.length,
+      mins,
+    });
     return {
       enabled: true,
-      available: Array.isArray(busy) ? busy.length === 0 : true,
+      available: busy.length === 0,
       reason: "ok",
-      busyCount: Array.isArray(busy) ? busy.length : 0,
+      busyCount: busy.length,
       mins,
     };
   } catch (e) {
-    console.log("⚠️ Google Calendar availability check failed (failing open):", e?.message || e);
-    return { enabled: true, available: true, reason: "api_error" };
+    console.log("⚠️ Google Calendar availability check failed (blocking booking):", e?.message || e);
+    return { enabled: true, available: false, reason: "api_error" };
   }
+}
+
+function calendarUnavailableLine(availability, stale = false) {
+  if (!availability?.enabled) {
+    return stale
+      ? "That time is no longer available. What other time works for you?"
+      : "That time is already booked. What other time works for you?";
+  }
+  if (availability.reason === "ok") {
+    return stale
+      ? "That time is no longer available in the calendar. What other time works for you?"
+      : "That time is already booked in the calendar. What other time works for you?";
+  }
+  return "I could not verify the calendar right now. Please try another time, or I can connect you to the salon.";
 }
 
 async function postBookingToZapier(payload) {
@@ -1282,7 +1320,7 @@ If no year is specified, assume the next upcoming future date.
               const keepDate = isoToDateOnly(pendingBooking.datetime) || getDraft(callSid).date || "";
               setDraft(callSid, { datetime: "", date: keepDate, time: null });
 
-              const line = "That time is no longer available in the calendar. What other time works for you?";
+              const line = calendarUnavailableLine(availability, true);
               const audio = await ttsWithRetry(line);
               const id = uuidv4();
               audioStore.set(id, audio);
@@ -1491,7 +1529,7 @@ If no year is specified, assume the next upcoming future date.
                 const keepDate = isoToDateOnly(completeFromDraft.datetime) || draftNow.date || "";
                 setDraft(callSid, { datetime: "", date: keepDate, time: null });
 
-                const line = "That time is already booked in the calendar. What other time works for you?";
+                const line = calendarUnavailableLine(availability, false);
                 const audio = await ttsWithRetry(line);
                 const id = uuidv4();
                 audioStore.set(id, audio);
@@ -1816,7 +1854,7 @@ If no year is specified, assume the next upcoming future date.
         if (isCompleteBooking(action)) {
           const availability = await checkGoogleCalendarAvailability(action);
           if (!availability.available) {
-            const line = "That time is already booked in the calendar. What other time works for you?";
+            const line = calendarUnavailableLine(availability, false);
             const audio = await ttsWithRetry(line);
             const id = uuidv4();
             audioStore.set(id, audio);
