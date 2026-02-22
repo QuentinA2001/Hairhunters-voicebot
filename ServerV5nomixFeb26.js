@@ -593,7 +593,10 @@ function parseNanpPhone(input) {
     for (const region of ["CA", "US"]) {
       try {
         const phone = parsePhoneNumberFromString(candidate, region);
-        if (!phone?.isValid?.()) continue;
+        // Use "possible" (format/length) instead of "valid" (assignment-level),
+        // so normal-looking test numbers don't get rejected and shifted.
+        const ok = Boolean(phone?.isPossible?.() || phone?.isValid?.());
+        if (!ok) continue;
         if (phone.country && !["CA", "US"].includes(phone.country)) continue;
         return phone;
       } catch {
