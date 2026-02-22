@@ -29,6 +29,8 @@ const BOT_TZ = process.env.BOT_TIMEZONE || "America/Toronto";
 const BUSINESS_OPEN_HOUR = 9;   // 9:00 AM
 const BUSINESS_CLOSE_HOUR = 17; // 5:00 PM
 const CLOSED_WEEKDAY = 7;       // Sunday in Luxon (Mon=1..Sun=7)
+const ELEVEN_STABILITY = Number(process.env.ELEVEN_STABILITY || "0.55");
+const ELEVEN_SIMILARITY = Number(process.env.ELEVEN_SIMILARITY || "0.75");
 
 // In-memory stores (OK for MVP; use Redis/S3 for production)
 const audioStore = new Map();            // id -> Buffer(mp3)
@@ -56,6 +58,24 @@ const clipIds = {
 function pickFillerId() {
   if (!fillerIds.length) return null;
   return fillerIds[Math.floor(Math.random() * fillerIds.length)];
+}
+
+function clamp01(n, fallback) {
+  const v = Number(n);
+  if (Number.isNaN(v)) return fallback;
+  if (v < 0) return 0;
+  if (v > 1) return 1;
+  return v;
+}
+
+function prepareTtsText(input) {
+  let out = String(input || "");
+  out = out.replace(/[–—]/g, ", ");
+  out = out.replace(/:\s+/g, ", ");
+  out = out.replace(/\s+/g, " ").trim();
+  out = out.replace(/([.!?])\1+/g, "$1");
+  if (out && !/[.!?]$/.test(out)) out += ".";
+  return out;
 }
 
 // ---------- PROMPT ----------
@@ -91,7 +111,7 @@ ACTION_JSON: {"action":"book","service":"...","stylist":"...","datetime":"ISO_FO
 
 // ---------- ELEVENLABS TTS ----------
 async function tts(text) {
-  const safe = String(text).slice(0, 800);
+  const safe = prepareTtsText(text).slice(0, 800);
   const voiceId = process.env.ELEVEN_VOICE_ID;
   const apiKey = process.env.ELEVEN_API_KEY;
 
@@ -109,7 +129,10 @@ async function tts(text) {
       {
         text: safe,
         model_id: "eleven_multilingual_v2",
-        voice_settings: { stability: 0.4, similarity_boost: 0.8 },
+        voice_settings: {
+          stability: clamp01(ELEVEN_STABILITY, 0.55),
+          similarity_boost: clamp01(ELEVEN_SIMILARITY, 0.75),
+        },
       },
       {
         headers: {
@@ -1309,7 +1332,7 @@ If no year is specified, assume the next upcoming future date.
               completeFromDraft._createdAt = Date.now();
               pendingBookings.set(callSid, completeFromDraft);
               const pretty = formatTorontoConfirm(completeFromDraft.datetime) || completeFromDraft.datetime;
-              const confirmLine = `Just to confirm: a ${completeFromDraft.service} with ${completeFromDraft.stylist} on ${pretty}, correct?`;
+              const confirmLine = `Just to confirm, a ${completeFromDraft.service} with ${completeFromDraft.stylist} on ${pretty}, correct?`;
 
               const audio = await ttsWithRetry(confirmLine);
               const id = uuidv4();
@@ -1589,7 +1612,7 @@ If no year is specified, assume the next upcoming future date.
           pendingBookings.set(callSid, action);
 
           const pretty = formatTorontoConfirm(action.datetime) || action.datetime;
-          const confirmLine = `Just to confirm: a ${action.service} with ${action.stylist} on ${pretty}, correct?`;
+          const confirmLine = `Just to confirm, a ${action.service} with ${action.stylist} on ${pretty}, correct?`;
 
           const audio = await ttsWithRetry(confirmLine);
           const id = uuidv4();
