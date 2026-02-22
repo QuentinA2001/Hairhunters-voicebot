@@ -10,6 +10,7 @@ import "dotenv/config";
 // ✅ NEW: date parsing add-on
 import * as chrono from "chrono-node";
 import { DateTime } from "luxon";
+import { parsePhoneNumberFromString } from "libphonenumber-js";
 
 const app = express();
 
@@ -569,27 +570,67 @@ function normalizePhone(s) {
   return digits;
 }
 
+function parseNanpPhone(input) {
+  const raw = String(input || "").trim();
+  if (!raw) return null;
+
+  const tries = [raw, raw.replace(/[^\d+]/g, ""), raw.replace(/\D/g, "")];
+  for (const candidate of tries) {
+    if (!candidate) continue;
+    for (const region of ["CA", "US"]) {
+      try {
+        const phone = parsePhoneNumberFromString(candidate, region);
+        if (!phone?.isValid?.()) continue;
+        if (phone.country && !["CA", "US"].includes(phone.country)) continue;
+        return phone;
+      } catch {
+        // ignore parse errors; caller speech can be noisy
+      }
+    }
+  }
+  return null;
+}
+
+function toValidNanpPhone10(input) {
+  const phone = parseNanpPhone(input);
+  if (!phone) return "";
+  const national = String(phone.nationalNumber || "");
+  return /^\d{10}$/.test(national) ? national : "";
+}
+
 function selectBestPhoneDigits(s) {
   const digits = String(s || "").replace(/\D/g, "");
   if (!digits) return "";
-  if (digits.length === 10) return digits;
-  if (digits.length === 11 && digits.startsWith("1")) return digits.slice(1);
+  if (digits.length === 10 || digits.length === 11) {
+    const exact = toValidNanpPhone10(digits);
+    if (exact) return exact;
+  }
   if (digits.length > 10) {
+    for (let i = 0; i <= digits.length - 11; i += 1) {
+      const cand11 = digits.slice(i, i + 11);
+      const valid11 = toValidNanpPhone10(cand11);
+      if (valid11) return valid11;
+    }
     for (let i = 0; i <= digits.length - 10; i += 1) {
       const cand = digits.slice(i, i + 10);
-      if (/^[2-9]\d{9}$/.test(cand)) return cand;
+      const valid10 = toValidNanpPhone10(cand);
+      if (valid10) return valid10;
     }
+    const first11 = digits.slice(0, 11);
+    const validFirst11 = toValidNanpPhone10(first11);
+    if (validFirst11) return validFirst11;
     const first10 = digits.slice(0, 10);
-    if (/^[2-9]\d{9}$/.test(first10)) return first10;
+    const validFirst10 = toValidNanpPhone10(first10);
+    if (validFirst10) return validFirst10;
     return digits.slice(-10);
   }
+  if (digits.length === 11 && digits.startsWith("1")) return digits.slice(1);
+  if (digits.length === 10) return digits;
   return digits;
 }
 
 function isLikelyNorthAmericanPhone(s) {
-  const d = selectBestPhoneDigits(s);
-  // Keep this permissive enough for real-world test numbers, while rejecting obvious bad parses like 005...
-  return /^\d{10}$/.test(d) && /^[2-9]\d{9}$/.test(d);
+  return Boolean(toValidNanpPhone10(s));
 }
 
 function cleanSpeech(text) {
