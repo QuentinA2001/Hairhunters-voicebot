@@ -36,6 +36,7 @@ const conversationStore = new Map();     // callSid -> messages[]
 const pendingTurns = new Map();          // token -> { ready, twiml, createdAt, fillerId }
 const pendingBookings = new Map();       // callSid -> booking payload waiting for confirm
 const lastResolvedDateStore = new Map(); // callSid -> YYYY-MM-DD
+const partialPhoneStore = new Map();     // callSid -> partial digit buffer
 
 // Keep-alive HTTP client (reduces latency)
 const httpsAgent = new https.Agent({ keepAlive: true });
@@ -547,7 +548,8 @@ function normalizePhone(s) {
 
 function isLikelyNorthAmericanPhone(s) {
   const d = normalizePhone(s);
-  return /^\d{10}$/.test(d) && /^[2-9]\d{2}[2-9]\d{6}$/.test(d);
+  // Keep this permissive enough for real-world test numbers, while rejecting obvious bad parses like 005...
+  return /^\d{10}$/.test(d) && /^[2-9]\d{9}$/.test(d);
 }
 
 function cleanSpeech(text) {
@@ -723,6 +725,9 @@ setInterval(() => {
   for (const sid of lastResolvedDateStore.keys()) {
     if (!conversationStore.has(sid)) lastResolvedDateStore.delete(sid);
   }
+  for (const sid of partialPhoneStore.keys()) {
+    if (!conversationStore.has(sid)) partialPhoneStore.delete(sid);
+  }
 }, 30_000);
 
 // ---- BOOKING DRAFT + PHONE CONFIRM STATE ----
@@ -736,6 +741,10 @@ function speakDigits(digits) {
   const mid = d.slice(3, 6).split("").join(" ");
   const tail = d.slice(6).split("").join(" ");
   return `${area}, ${mid}, ${tail}`;
+}
+
+function speakPartialDigits(digits) {
+  return normalizePhone(digits).split("").join(" ");
 }
 
 /**
@@ -1093,6 +1102,7 @@ If no year is specified, assume the next upcoming future date.
             conversationStore.delete(callSid);
             bookingDraftStore.delete(callSid);
             awaitingPhoneConfirm.delete(callSid);
+            partialPhoneStore.delete(callSid);
             lastResolvedDateStore.delete(callSid);
             return;
           } catch (err) {
@@ -1228,6 +1238,12 @@ If no year is specified, assume the next upcoming future date.
 
         // ---- PHONE CONFIRM FLOW (server-controlled) ----
         const maybePhone = extractLikelyPhoneFromSpeech(userSpeech);
+        const maybePhoneDigits = normalizePhone(maybePhone);
+        const draftForPhone = getDraft(callSid);
+        const expectingPhoneNow =
+          !draftForPhone.phone &&
+          getNextMissingQuestion(draftForPhone) === "What’s the best 10-digit phone number for the booking?";
+        const hasPhoneIntent = /\b(phone|number|digits?)\b/.test(cleanSpeech(userSpeech));
 
         // A) If we are waiting on "yes/no" to confirm phone
         if (awaitingPhoneConfirm.has(callSid)) {
@@ -1254,6 +1270,7 @@ If no year is specified, assume the next upcoming future date.
               content: `Caller phone confirmed: ${pendingPhone}. Do NOT ask for phone again.`,
             });
             awaitingPhoneConfirm.delete(callSid);
+            partialPhoneStore.delete(callSid);
 
             const nextQuestion = getNextMissingQuestion(getDraft(callSid));
             const line = nextQuestion
@@ -1273,6 +1290,7 @@ If no year is specified, assume the next upcoming future date.
 
           if (isNo(userSpeech)) {
             awaitingPhoneConfirm.delete(callSid);
+            partialPhoneStore.delete(callSid);
 
             const line = "No worries — can you say the full 10-digit phone number again, one digit at a time?";
             const audio = await ttsWithRetry(line);
@@ -1304,9 +1322,44 @@ If no year is specified, assume the next upcoming future date.
           return;
         }
 
-        // B) If caller just said a full phone number this turn -> ask for confirmation
-        if (isLikelyNorthAmericanPhone(maybePhone) && !getDraft(callSid).phone) {
-          const cleanPhone = normalizePhone(maybePhone);
+        // B) Collect phone digits (supports split utterances like "905", then remaining digits)
+        if (!draftForPhone.phone) {
+          const previousPartial = partialPhoneStore.get(callSid) || "";
+          const shouldTreatAsPhone =
+            expectingPhoneNow || hasPhoneIntent || previousPartial.length > 0 || maybePhoneDigits.length >= 7;
+          if (shouldTreatAsPhone && maybePhoneDigits) {
+            const combined = normalizePhone(`${previousPartial}${maybePhoneDigits}`);
+            if (combined.length < 10) {
+              partialPhoneStore.set(callSid, combined);
+              const line = `I got ${speakPartialDigits(combined)}. Please say the remaining digits.`;
+              const audio = await ttsWithRetry(line);
+              const id = uuidv4();
+              audioStore.set(id, audio);
+
+              entry.ready = true;
+              entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
+</Response>`;
+              return;
+            }
+
+            const cleanPhone = combined.slice(-10);
+            partialPhoneStore.delete(callSid);
+            if (!isLikelyNorthAmericanPhone(cleanPhone)) {
+              const line = "That didn’t sound like a valid 10-digit number. Please say it again, one digit at a time.";
+              const audio = await ttsWithRetry(line);
+              const id = uuidv4();
+              audioStore.set(id, audio);
+
+              entry.ready = true;
+              entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
+</Response>`;
+              return;
+            }
+
           awaitingPhoneConfirm.set(callSid, cleanPhone);
 
           const spokenPhone = speakDigits(cleanPhone);
@@ -1324,18 +1377,6 @@ If no year is specified, assume the next upcoming future date.
 </Response>`;
           return;
         }
-        if (!getDraft(callSid).phone && maybePhone && !isLikelyNorthAmericanPhone(maybePhone)) {
-          const line = "Please say the full 10-digit phone number, one digit at a time.";
-          const audio = await ttsWithRetry(line);
-          const id = uuidv4();
-          audioStore.set(id, audio);
-
-          entry.ready = true;
-          entry.twiml = `<Response>
-  <Play>${host}/audio/${id}.mp3</Play>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
-</Response>`;
-          return;
         }
 
         // Remind the model what we already collected (prevents re-asking)
@@ -1429,6 +1470,7 @@ If no year is specified, assume the next upcoming future date.
           conversationStore.delete(callSid);
           bookingDraftStore.delete(callSid);
           awaitingPhoneConfirm.delete(callSid);
+          partialPhoneStore.delete(callSid);
           lastResolvedDateStore.delete(callSid);
           return;
         }
