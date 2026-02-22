@@ -226,11 +226,6 @@ function extractNameFromSpeech(text, opts = {}) {
   if (!t) return null;
   if (isYes(t) || isNo(t)) return null;
   if (/\d/.test(raw)) return null;
-  if (extractLikelyPhoneFromSpeech(raw).length >= 7) return null;
-  if (extractStylistFromSpeech(raw) || extractServiceFromSpeech(raw)) return null;
-  if (detectWeekday(raw) || hasNextWeekOnlyIntent(raw) || hasForwardWeekdayIntent(raw)) return null;
-  if (extractTimeOnly(raw) || extractTimeFromSpeech(raw)) return null;
-  if (DATE_WORD_RE.test(t)) return null;
 
   const explicit =
     raw.match(/\b(?:my name is|name is|this is|i am|i'm|it is|it's)\s+([a-z][a-z' -]{0,40}?)(?=\s+(?:and|my|phone|number|for|to|with|at)\b|$)/i) ||
@@ -240,6 +235,12 @@ function extractNameFromSpeech(text, opts = {}) {
     const candidate = titleCaseName(clipped);
     if (candidate && !isYes(candidate) && !isNo(candidate)) return candidate;
   }
+
+  if (extractLikelyPhoneFromSpeech(raw).length >= 7) return null;
+  if (extractStylistFromSpeech(raw) || extractServiceFromSpeech(raw)) return null;
+  if (detectWeekday(raw) || hasNextWeekOnlyIntent(raw) || hasForwardWeekdayIntent(raw)) return null;
+  if (extractTimeOnly(raw) || extractTimeFromSpeech(raw)) return null;
+  if (DATE_WORD_RE.test(t)) return null;
 
   if (!opts.expectingName) return null;
 
@@ -533,7 +534,7 @@ function isCompleteBooking(action) {
     action.stylist &&
     action.datetime &&
     action.name &&
-    normalized.length === 10
+    isLikelyNorthAmericanPhone(normalized)
   );
 }
 
@@ -542,6 +543,11 @@ function normalizePhone(s) {
   if (!digits) return "";
   if (digits.length > 10) return digits.slice(-10);
   return digits;
+}
+
+function isLikelyNorthAmericanPhone(s) {
+  const d = normalizePhone(s);
+  return /^\d{10}$/.test(d) && /^[2-9]\d{2}[2-9]\d{6}$/.test(d);
 }
 
 function cleanSpeech(text) {
@@ -666,7 +672,7 @@ function mergeBookActionWithDraft(action, draft) {
 }
 
 function draftToBookAction(draft) {
-  if (!draft.service || !draft.stylist || !draft.datetime || !draft.name || !draft.phone) return null;
+  if (!draft.service || !draft.stylist || !draft.datetime || !draft.name || !isLikelyNorthAmericanPhone(draft.phone)) return null;
   return {
     action: "book",
     service: draft.service,
@@ -726,13 +732,9 @@ const awaitingPhoneConfirm = new Map();   // callSid -> "9055558851" waiting for
 function speakDigits(digits) {
   const d = normalizePhone(digits);
   if (d.length !== 10) return "";
-  const words = {
-    "0": "zero", "1": "one", "2": "two", "3": "three", "4": "four",
-    "5": "five", "6": "six", "7": "seven", "8": "eight", "9": "nine",
-  };
-  const area = d.slice(0, 3).split("").map((n) => words[n]).join(" ");
-  const mid = d.slice(3, 6).split("").map((n) => words[n]).join(" ");
-  const tail = d.slice(6).split("").map((n) => words[n]).join(" ");
+  const area = d.slice(0, 3).split("").join(" ");
+  const mid = d.slice(3, 6).split("").join(" ");
+  const tail = d.slice(6).split("").join(" ");
   return `${area}, ${mid}, ${tail}`;
 }
 
@@ -1230,7 +1232,7 @@ If no year is specified, assume the next upcoming future date.
         // A) If we are waiting on "yes/no" to confirm phone
         if (awaitingPhoneConfirm.has(callSid)) {
           const pendingPhone = normalizePhone(awaitingPhoneConfirm.get(callSid));
-          if (pendingPhone.length !== 10) {
+          if (!isLikelyNorthAmericanPhone(pendingPhone)) {
             awaitingPhoneConfirm.delete(callSid);
             const line = "Sorry, I missed that number. Please say the full 10-digit phone number again, one digit at a time.";
             const audio = await ttsWithRetry(line);
@@ -1303,7 +1305,7 @@ If no year is specified, assume the next upcoming future date.
         }
 
         // B) If caller just said a full phone number this turn -> ask for confirmation
-        if (normalizePhone(maybePhone).length === 10 && !getDraft(callSid).phone) {
+        if (isLikelyNorthAmericanPhone(maybePhone) && !getDraft(callSid).phone) {
           const cleanPhone = normalizePhone(maybePhone);
           awaitingPhoneConfirm.set(callSid, cleanPhone);
 
@@ -1311,6 +1313,19 @@ If no year is specified, assume the next upcoming future date.
           const line = spokenPhone
             ? `Just to confirm — is your number ${spokenPhone}?`
             : "Sorry, I missed that number. Please say the full 10-digit phone number again, one digit at a time.";
+          const audio = await ttsWithRetry(line);
+          const id = uuidv4();
+          audioStore.set(id, audio);
+
+          entry.ready = true;
+          entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
+</Response>`;
+          return;
+        }
+        if (!getDraft(callSid).phone && maybePhone && !isLikelyNorthAmericanPhone(maybePhone)) {
+          const line = "Please say the full 10-digit phone number, one digit at a time.";
           const audio = await ttsWithRetry(line);
           const id = uuidv4();
           audioStore.set(id, audio);
@@ -1372,7 +1387,7 @@ If no year is specified, assume the next upcoming future date.
           if (action.service) patchFromAction.service = action.service;
           if (action.stylist) patchFromAction.stylist = action.stylist;
           if (action.name) patchFromAction.name = action.name;
-          if (action.phone && normalizePhone(action.phone).length === 10) {
+          if (action.phone && isLikelyNorthAmericanPhone(action.phone)) {
             patchFromAction.phone = normalizePhone(action.phone);
           }
           const shouldAcceptActionDatetime = Boolean(
