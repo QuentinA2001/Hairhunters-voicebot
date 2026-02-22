@@ -795,8 +795,11 @@ function assistantSeemsToAskForName(text) {
   return (
     /\bwhat(?:s| is)?\s+your\s+name\b/.test(t) ||
     /\bcan i get your name\b/.test(t) ||
+    /\bcan i have your name\b/.test(t) ||
     /\bname\s+for\s+the\s+booking\b/.test(t) ||
-    /\bwho\s+should\s+i\s+put\s+the\s+booking\s+under\b/.test(t)
+    /\bwho\s+should\s+i\s+put\s+the\s+booking\s+under\b/.test(t) ||
+    /\bwho am i speaking with\b/.test(t) ||
+    /\bwho is this\b/.test(t)
   );
 }
 
@@ -1128,17 +1131,25 @@ function extractLikelyPhoneFromSpeech(speech) {
   const directDigits = raw.replace(/\D/g, "");
   if (directDigits.length >= 10) return selectBestPhoneDigits(directDigits);
 
-  const tokenMap = {
+  const strictMap = {
     zero: "0", oh: "0", o: "0",
-    one: "1", won: "1",
-    two: "2", to: "2", too: "2",
-    three: "3", tree: "3",
-    four: "4", for: "4",
+    one: "1",
+    two: "2",
+    three: "3",
+    four: "4",
     five: "5",
     six: "6",
     seven: "7",
-    eight: "8", ate: "8",
+    eight: "8",
     nine: "9",
+  };
+  const homophoneMap = {
+    won: "1",
+    to: "2",
+    too: "2",
+    tree: "3",
+    for: "4",
+    ate: "8",
   };
   const phoneContext = /\b(phone|number|digits?|call me|reach me)\b/.test(raw);
   const tokens = raw
@@ -1148,16 +1159,27 @@ function extractLikelyPhoneFromSpeech(speech) {
     .replace(/[^\w\s]/g, " ")
     .split(/\s+/)
     .filter(Boolean);
+  const numericishToken = (tok) => Boolean(strictMap[tok] || homophoneMap[tok] || /^\d+$/.test(tok));
 
   let built = "";
   let mappedCount = 0;
-  for (const tok of tokens) {
+  for (let i = 0; i < tokens.length; i += 1) {
+    const tok = tokens[i];
     if (/^\d+$/.test(tok)) {
       built += tok;
       mappedCount += tok.length;
       continue;
     }
-    const mapped = tokenMap[tok];
+    let mapped = strictMap[tok];
+    if (!mapped && homophoneMap[tok]) {
+      const prev = tokens[i - 1] || "";
+      const next = tokens[i + 1] || "";
+      // Only treat risky homophones as digits when surrounded by number-like tokens
+      // or when the utterance explicitly looks like a phone-number response.
+      if (phoneContext || numericishToken(prev) || numericishToken(next)) {
+        mapped = homophoneMap[tok];
+      }
+    }
     if (mapped) {
       built += mapped;
       mappedCount += 1;
