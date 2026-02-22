@@ -43,6 +43,7 @@ const pendingTurns = new Map();          // token -> { ready, twiml, createdAt, 
 const pendingBookings = new Map();       // callSid -> booking payload waiting for confirm
 const lastResolvedDateStore = new Map(); // callSid -> YYYY-MM-DD
 const partialPhoneStore = new Map();     // callSid -> partial digit buffer
+const lastCalendarConflictStore = new Map(); // callSid -> { dateISO, service, createdAt }
 
 // Keep-alive HTTP client (reduces latency)
 const httpsAgent = new https.Agent({ keepAlive: true });
@@ -1078,6 +1079,9 @@ setInterval(() => {
   for (const sid of partialPhoneStore.keys()) {
     if (!conversationStore.has(sid)) partialPhoneStore.delete(sid);
   }
+  for (const sid of lastCalendarConflictStore.keys()) {
+    if (!conversationStore.has(sid)) lastCalendarConflictStore.delete(sid);
+  }
 }, 30_000);
 
 // ---- BOOKING DRAFT + PHONE CONFIRM STATE ----
@@ -1429,10 +1433,13 @@ If no year is specified, assume the next upcoming future date.
           }
         }
 
+        const conflictCtx = lastCalendarConflictStore.get(callSid);
         const lastAssistantSpoken =
           [...messages].reverse().find((m) => m?.role === "assistant")?.content || "";
         const availabilityFollowUpIntent =
           asksAvailableTimesOnDay(userSpeech) ||
+          (Boolean(conflictCtx) &&
+            /\b(what|which|any|other|else|open|available|time|times|slot|slots|options?)\b/.test(cleanSpeech(userSpeech))) ||
           (assistantSaidTimeUnavailable(lastAssistantSpoken) &&
             /\b(what|which|any|other|else|open|available|time|times|slot|slots)\b/.test(cleanSpeech(userSpeech)));
 
@@ -1441,9 +1448,10 @@ If no year is specified, assume the next upcoming future date.
           const pendingNow = pendingBookings.get(callSid);
           const targetDate =
             draftNow.date ||
+            conflictCtx?.dateISO ||
             lastResolvedDateStore.get(callSid) ||
             isoToDateOnly(draftNow.datetime || pendingNow?.datetime);
-          const targetService = draftNow.service || pendingNow?.service || "";
+          const targetService = draftNow.service || conflictCtx?.service || pendingNow?.service || "";
 
           if (!targetDate) {
             const line = "I can check that once I have the day. What day were you looking for?";
@@ -1473,6 +1481,14 @@ If no year is specified, assume the next upcoming future date.
             line = formatAvailableTimeListLine(targetDate, dayAvailability.slots);
           }
 
+          if (dayAvailability.ok) {
+            lastCalendarConflictStore.set(callSid, {
+              dateISO: targetDate,
+              service: targetService,
+              createdAt: Date.now(),
+            });
+          }
+
           const audio = await ttsWithRetry(line);
           const id = uuidv4();
           audioStore.set(id, audio);
@@ -1494,6 +1510,11 @@ If no year is specified, assume the next upcoming future date.
               pendingBookings.delete(callSid);
               const keepDate = isoToDateOnly(pendingBooking.datetime) || getDraft(callSid).date || "";
               setDraft(callSid, { datetime: "", date: keepDate, time: null });
+              lastCalendarConflictStore.set(callSid, {
+                dateISO: keepDate,
+                service: pendingBooking.service || getDraft(callSid).service || "",
+                createdAt: Date.now(),
+              });
 
               const line = calendarUnavailableLine(availability, true);
               const audio = await ttsWithRetry(line);
@@ -1527,6 +1548,7 @@ If no year is specified, assume the next upcoming future date.
             bookingDraftStore.delete(callSid);
             awaitingPhoneConfirm.delete(callSid);
             partialPhoneStore.delete(callSid);
+            lastCalendarConflictStore.delete(callSid);
             lastResolvedDateStore.delete(callSid);
             return;
           } catch (err) {
@@ -1703,6 +1725,11 @@ If no year is specified, assume the next upcoming future date.
               if (!availability.available) {
                 const keepDate = isoToDateOnly(completeFromDraft.datetime) || draftNow.date || "";
                 setDraft(callSid, { datetime: "", date: keepDate, time: null });
+                lastCalendarConflictStore.set(callSid, {
+                  dateISO: keepDate,
+                  service: completeFromDraft.service || draftNow.service || "",
+                  createdAt: Date.now(),
+                });
 
                 const line = calendarUnavailableLine(availability, false);
                 const audio = await ttsWithRetry(line);
@@ -2002,6 +2029,7 @@ If no year is specified, assume the next upcoming future date.
           bookingDraftStore.delete(callSid);
           awaitingPhoneConfirm.delete(callSid);
           partialPhoneStore.delete(callSid);
+          lastCalendarConflictStore.delete(callSid);
           lastResolvedDateStore.delete(callSid);
           return;
         }
@@ -2036,6 +2064,11 @@ If no year is specified, assume the next upcoming future date.
 
             const keepDate = isoToDateOnly(action.datetime) || getDraft(callSid).date || "";
             setDraft(callSid, { datetime: "", date: keepDate, time: null });
+            lastCalendarConflictStore.set(callSid, {
+              dateISO: keepDate,
+              service: action.service || getDraft(callSid).service || "",
+              createdAt: Date.now(),
+            });
             entry.ready = true;
             entry.twiml = `<Response>
   <Play>${host}/audio/${id}.mp3</Play>
