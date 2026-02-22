@@ -345,6 +345,10 @@ function resolveDateOnlyISO(text, opts = {}) {
     const base = DateTime.fromISO(`${opts.afterDateISO}T00:00:00`, { zone: BOT_TZ }).startOf("day");
     if (base.isValid) return base.plus({ days: 7 }).toFormat("yyyy-LL-dd");
   }
+  // Ambiguous "next week" without anchor should not auto-pick a day.
+  if (hasNextWeekOnlyIntent(input) && !opts?.afterDateISO) {
+    return null;
+  }
 
   const relative = resolveRelativeDayISO(input);
   if (relative) return relative;
@@ -759,6 +763,7 @@ app.post("/voice/turn", async (req, res) => {
       hasForwardDateIntent
         ? (draftAtTurnStart.date || isoToDateOnly(pendingAtTurnStart?.datetime))
         : null;
+    const isAmbiguousNextWeekOnly = hasNextWeekOnlyIntent(t) && !contextDateForCorrection;
 
     // Server-owned slot extraction on every utterance
     let foundDateOnly = resolveDateOnlyISO(userSpeech, { afterDateISO: contextDateForCorrection });
@@ -846,6 +851,20 @@ If no year is specified, assume the next upcoming future date.
       if (!entry) return;
 
       try {
+        if (isAmbiguousNextWeekOnly) {
+          const line = "What day next week were you looking for?";
+          const audio = await ttsWithRetry(line);
+          const id = uuidv4();
+          audioStore.set(id, audio);
+
+          entry.ready = true;
+          entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+</Response>`;
+          return;
+        }
+
         // deterministic answer for "what date is that?"
         if (asksWhatDate(userSpeech)) {
           const remembered = lastResolvedDateStore.get(callSid) || getDraft(callSid).date;
