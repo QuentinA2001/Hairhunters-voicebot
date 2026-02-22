@@ -667,14 +667,33 @@ function asksWhatDate(text) {
 function asksAvailableTimesOnDay(text) {
   const t = cleanSpeech(text);
   if (!t) return false;
-  if (!/\b(time|times|availability|available|open)\b/.test(t)) return false;
-  if (!/\b(other|else|what|which|any)\b/.test(t)) return false;
+  if (/\bwhat\s+time\b/.test(t) && !/\bother|else|available|open|options?\b/.test(t)) return false;
+  const hasTimeAvailabilityWord = /\b(time|times|availability|available|open|slot|slots)\b/.test(t);
+  const hasAskingWord = /\b(other|else|what|which|any|options?)\b/.test(t);
+  const hasDayReference = /\b(that day|that date|same day|that afternoon|that evening|for that day|on that day)\b/.test(t);
+  if (!(hasTimeAvailabilityWord && (hasAskingWord || hasDayReference))) return false;
   return (
     /\bwhat\s+(?:other\s+)?times?\s+(?:are\s+)?(?:available|open)\b/.test(t) ||
+    /\bwhat\s+(?:other\s+)?slots?\s+(?:are\s+)?(?:available|open)\b/.test(t) ||
     /\bwhat\s+else\s+is\s+available\b/.test(t) ||
     /\bany\s+other\s+times?\b/.test(t) ||
+    /\bany\s+other\s+slots?\b/.test(t) ||
+    /\bwhat\s+other\s+options?\b/.test(t) ||
+    /\bwhat\s+times?\s+(?:do you have|are open|are free)\b/.test(t) ||
+    /\bwhich\s+times?\s+(?:are open|are available)\b/.test(t) ||
     /\bother\s+times?\s+(?:that\s+day|on\s+that\s+day|on\s+that\s+date|that\s+date)\b/.test(t) ||
-    /\bavailability\s+(?:for|on)\s+that\s+(?:day|date)\b/.test(t)
+    /\bavailability\s+(?:for|on)\s+that\s+(?:day|date)\b/.test(t) ||
+    (hasDayReference && /\b(available|open|free|times?|slots?)\b/.test(t))
+  );
+}
+
+function assistantSaidTimeUnavailable(text) {
+  const t = cleanSpeech(text);
+  if (!t) return false;
+  return (
+    /\btime\s+is\s+(?:already\s+booked|no longer available)\b/.test(t) ||
+    /\balready booked in the calendar\b/.test(t) ||
+    /\bwhat other time works for you\b/.test(t)
   );
 }
 
@@ -1410,7 +1429,14 @@ If no year is specified, assume the next upcoming future date.
           }
         }
 
-        if (asksAvailableTimesOnDay(userSpeech)) {
+        const lastAssistantSpoken =
+          [...messages].reverse().find((m) => m?.role === "assistant")?.content || "";
+        const availabilityFollowUpIntent =
+          asksAvailableTimesOnDay(userSpeech) ||
+          (assistantSaidTimeUnavailable(lastAssistantSpoken) &&
+            /\b(what|which|any|other|else|open|available|time|times|slot|slots)\b/.test(cleanSpeech(userSpeech)));
+
+        if (availabilityFollowUpIntent) {
           const draftNow = getDraft(callSid);
           const pendingNow = pendingBookings.get(callSid);
           const targetDate =
