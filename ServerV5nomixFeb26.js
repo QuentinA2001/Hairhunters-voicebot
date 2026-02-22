@@ -11,6 +11,7 @@ import "dotenv/config";
 import * as chrono from "chrono-node";
 import { DateTime } from "luxon";
 import { parsePhoneNumberFromString } from "libphonenumber-js";
+import { google } from "googleapis";
 
 const app = express();
 
@@ -32,6 +33,7 @@ const BUSINESS_CLOSE_HOUR = 17; // 5:00 PM
 const CLOSED_WEEKDAY = 7;       // Sunday in Luxon (Mon=1..Sun=7)
 const ELEVEN_STABILITY = Number(process.env.ELEVEN_STABILITY || "0.55");
 const ELEVEN_SIMILARITY = Number(process.env.ELEVEN_SIMILARITY || "0.75");
+const DEFAULT_SERVICE_DURATION_MIN = Number(process.env.DEFAULT_SERVICE_DURATION_MIN || "60");
 
 // In-memory stores (OK for MVP; use Redis/S3 for production)
 const audioStore = new Map();            // id -> Buffer(mp3)
@@ -789,6 +791,93 @@ function draftToBookAction(draft) {
   };
 }
 
+function getServiceDurationMinutes(service) {
+  const t = cleanSpeech(service || "");
+  if (t.includes("cut") && (t.includes("colour") || t.includes("color"))) {
+    return Number(process.env.DURATION_CUT_COLOUR_MIN || process.env.DURATION_CUT_COLOR_MIN || "180");
+  }
+  if (t.includes("colour") || t.includes("color")) {
+    return Number(process.env.DURATION_COLOUR_MIN || process.env.DURATION_COLOR_MIN || "120");
+  }
+  if (t.includes("haircut") || t.includes("cut") || t.includes("trim")) {
+    return Number(process.env.DURATION_HAIRCUT_MIN || "60");
+  }
+  return DEFAULT_SERVICE_DURATION_MIN;
+}
+
+function getGoogleCalendarConfig() {
+  const calendarId = String(process.env.GOOGLE_CALENDAR_ID || "").trim();
+  if (!calendarId) return null;
+
+  if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
+    try {
+      const parsed = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+      if (parsed?.client_email && parsed?.private_key) {
+        return {
+          calendarId,
+          credentials: {
+            client_email: parsed.client_email,
+            private_key: String(parsed.private_key).replace(/\\n/g, "\n"),
+          },
+        };
+      }
+    } catch (e) {
+      console.log("⚠️ GOOGLE_SERVICE_ACCOUNT_JSON parse error:", e?.message || e);
+    }
+  }
+
+  if (process.env.GOOGLE_CLIENT_EMAIL && process.env.GOOGLE_PRIVATE_KEY) {
+    return {
+      calendarId,
+      credentials: {
+        client_email: process.env.GOOGLE_CLIENT_EMAIL,
+        private_key: String(process.env.GOOGLE_PRIVATE_KEY).replace(/\\n/g, "\n"),
+      },
+    };
+  }
+
+  return null;
+}
+
+async function checkGoogleCalendarAvailability(booking) {
+  const cfg = getGoogleCalendarConfig();
+  if (!cfg) return { enabled: false, available: true, reason: "not_configured" };
+
+  const start = DateTime.fromISO(String(booking?.datetime || ""), { zone: BOT_TZ });
+  if (!start.isValid) return { enabled: true, available: true, reason: "invalid_datetime" };
+
+  const mins = Math.max(15, Number(getServiceDurationMinutes(booking?.service) || DEFAULT_SERVICE_DURATION_MIN));
+  const end = start.plus({ minutes: mins });
+
+  try {
+    const auth = new google.auth.GoogleAuth({
+      credentials: cfg.credentials,
+      scopes: ["https://www.googleapis.com/auth/calendar.readonly"],
+    });
+    const calendar = google.calendar({ version: "v3", auth });
+    const resp = await calendar.freebusy.query({
+      requestBody: {
+        timeMin: start.toUTC().toISO(),
+        timeMax: end.toUTC().toISO(),
+        timeZone: BOT_TZ,
+        items: [{ id: cfg.calendarId }],
+      },
+    });
+
+    const busy = resp?.data?.calendars?.[cfg.calendarId]?.busy || [];
+    return {
+      enabled: true,
+      available: Array.isArray(busy) ? busy.length === 0 : true,
+      reason: "ok",
+      busyCount: Array.isArray(busy) ? busy.length : 0,
+      mins,
+    };
+  } catch (e) {
+    console.log("⚠️ Google Calendar availability check failed (failing open):", e?.message || e);
+    return { enabled: true, available: true, reason: "api_error" };
+  }
+}
+
 async function postBookingToZapier(payload) {
   const url = process.env.BOOKING_WEBHOOK_URL;
   if (!url) throw new Error("BOOKING_WEBHOOK_URL missing");
@@ -1187,6 +1276,25 @@ If no year is specified, assume the next upcoming future date.
 
         if (pendingBooking && isYes(userSpeech)) {
           try {
+            const availability = await checkGoogleCalendarAvailability(pendingBooking);
+            if (!availability.available) {
+              pendingBookings.delete(callSid);
+              const keepDate = isoToDateOnly(pendingBooking.datetime) || getDraft(callSid).date || "";
+              setDraft(callSid, { datetime: "", date: keepDate, time: null });
+
+              const line = "That time is no longer available in the calendar. What other time works for you?";
+              const audio = await ttsWithRetry(line);
+              const id = uuidv4();
+              audioStore.set(id, audio);
+
+              entry.ready = true;
+              entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
+</Response>`;
+              return;
+            }
+
             console.log("✅ Confirmed booking, posting to Zapier:", pendingBooking);
             await postBookingToZapier(pendingBooking);
 
@@ -1378,6 +1486,24 @@ If no year is specified, assume the next upcoming future date.
             const draftNow = getDraft(callSid);
             const completeFromDraft = draftToBookAction(draftNow);
             if (completeFromDraft) {
+              const availability = await checkGoogleCalendarAvailability(completeFromDraft);
+              if (!availability.available) {
+                const keepDate = isoToDateOnly(completeFromDraft.datetime) || draftNow.date || "";
+                setDraft(callSid, { datetime: "", date: keepDate, time: null });
+
+                const line = "That time is already booked in the calendar. What other time works for you?";
+                const audio = await ttsWithRetry(line);
+                const id = uuidv4();
+                audioStore.set(id, audio);
+
+                entry.ready = true;
+                entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
+</Response>`;
+                return;
+              }
+
               const bizViolation = getBusinessViolation(completeFromDraft.datetime);
               if (bizViolation === "closed_day") {
                 const line = "We're closed on Sundays. What day works for you Monday through Saturday?";
@@ -1688,6 +1814,23 @@ If no year is specified, assume the next upcoming future date.
         }
 
         if (isCompleteBooking(action)) {
+          const availability = await checkGoogleCalendarAvailability(action);
+          if (!availability.available) {
+            const line = "That time is already booked in the calendar. What other time works for you?";
+            const audio = await ttsWithRetry(line);
+            const id = uuidv4();
+            audioStore.set(id, audio);
+
+            const keepDate = isoToDateOnly(action.datetime) || getDraft(callSid).date || "";
+            setDraft(callSid, { datetime: "", date: keepDate, time: null });
+            entry.ready = true;
+            entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
+</Response>`;
+            return;
+          }
+
           const bizViolation = getBusinessViolation(action.datetime);
           if (bizViolation === "closed_day") {
             const line = "We're closed on Sundays. What day works for you Monday through Saturday?";
@@ -1868,6 +2011,10 @@ app.get("/env-check", (_, res) => {
     pendingTurns: pendingTurns.size,
     pendingBookings: pendingBookings.size,
     BOT_TIMEZONE: BOT_TZ,
+    GOOGLE_CALENDAR_ID: process.env.GOOGLE_CALENDAR_ID ? "set" : "missing",
+    GOOGLE_SERVICE_ACCOUNT_JSON: process.env.GOOGLE_SERVICE_ACCOUNT_JSON ? "set" : "missing",
+    GOOGLE_CLIENT_EMAIL: process.env.GOOGLE_CLIENT_EMAIL ? "set" : "missing",
+    GOOGLE_PRIVATE_KEY: process.env.GOOGLE_PRIVATE_KEY ? "set" : "missing",
   });
 });
 
