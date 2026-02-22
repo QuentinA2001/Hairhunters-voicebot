@@ -71,7 +71,16 @@ function clamp01(n, fallback) {
 
 function prepareTtsText(input) {
   let out = String(input || "");
-  out = out.replace(/[–—]/g, ", ");
+  out = out.normalize("NFKC");
+  out = out.replace(/[\u200B-\u200D\uFEFF]/g, "");
+  out = out.replace(/\u00A0/g, " ");
+  out = out.replace(/[‘’]/g, "'");
+  out = out.replace(/[“”]/g, '"');
+  out = out.replace(/\u2026/g, "...");
+  out = out.replace(/[‐‑‒–—]/g, "-");
+  out = out.replace(/[\u0000-\u001F\u007F]/g, " ");
+  out = out.replace(/\b(\d+)-digit\b/gi, "$1 digit");
+  out = out.replace(/\s+-\s+/g, ", ");
   out = out.replace(/:\s+/g, ", ");
   out = out.replace(/\s+/g, " ").trim();
   out = out.replace(/([.!?])\1+/g, "$1");
@@ -748,7 +757,7 @@ function getNextMissingQuestion(draft) {
   if (!draft.stylist) return "Which stylist would you like: Cosmo, Vince, or Cassidy?";
   if (!draft.datetime) return draft.date ? "What time works for you?" : "What day works best for you?";
   if (!draft.name) return "Can I get your name for the booking?";
-  if (!draft.phone) return "What’s the best 10-digit phone number for the booking?";
+  if (!draft.phone) return "What is the best 10 digit phone number for the booking?";
   return null;
 }
 
@@ -1332,7 +1341,7 @@ If no year is specified, assume the next upcoming future date.
         const draftForPhone = getDraft(callSid);
         const expectingPhoneNow =
           !draftForPhone.phone &&
-          getNextMissingQuestion(draftForPhone) === "What’s the best 10-digit phone number for the booking?";
+          getNextMissingQuestion(draftForPhone) === "What is the best 10 digit phone number for the booking?";
         const hasPhoneIntent = /\b(phone|number|digits?)\b/.test(cleanSpeech(userSpeech));
 
         // A) If we are waiting on "yes/no" to confirm phone
