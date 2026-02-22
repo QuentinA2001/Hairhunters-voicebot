@@ -1422,10 +1422,33 @@ If no year is specified, assume the next upcoming future date.
 
         // B) Collect phone digits (supports split utterances like "905", then remaining digits)
         if (!draftForPhone.phone) {
-          const previousPartial = partialPhoneStore.get(callSid) || "";
+          const currentFullPhone = isLikelyNorthAmericanPhone(maybePhoneDigits)
+            ? normalizePhone(maybePhoneDigits)
+            : "";
+          const previousPartial = currentFullPhone ? "" : (partialPhoneStore.get(callSid) || "");
           const shouldTreatAsPhone =
             expectingPhoneNow || hasPhoneIntent || previousPartial.length > 0 || maybePhoneDigits.length >= 7;
           if (shouldTreatAsPhone && maybePhoneDigits) {
+            if (currentFullPhone) {
+              partialPhoneStore.delete(callSid);
+              awaitingPhoneConfirm.set(callSid, currentFullPhone);
+
+              const spokenPhone = speakDigits(currentFullPhone);
+              const line = spokenPhone
+                ? `Just to confirm — is your number ${spokenPhone}?`
+                : "Sorry, I missed that number. Please say the full 10-digit phone number again, one digit at a time.";
+              const audio = await ttsWithRetry(line);
+              const id = uuidv4();
+              audioStore.set(id, audio);
+
+              entry.ready = true;
+              entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
+</Response>`;
+              return;
+            }
+
             const minimumChunk = previousPartial.length > 0 ? 1 : 3;
             if (maybePhoneDigits.length < minimumChunk) {
               const line = "Please say your full 10-digit phone number, one digit at a time.";
@@ -1473,7 +1496,7 @@ If no year is specified, assume the next upcoming future date.
               return;
             }
 
-          awaitingPhoneConfirm.set(callSid, cleanPhone);
+            awaitingPhoneConfirm.set(callSid, cleanPhone);
 
           const spokenPhone = speakDigits(cleanPhone);
           const line = spokenPhone
