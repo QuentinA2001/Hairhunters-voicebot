@@ -1272,10 +1272,59 @@ If no year is specified, assume the next upcoming future date.
             awaitingPhoneConfirm.delete(callSid);
             partialPhoneStore.delete(callSid);
 
-            const nextQuestion = getNextMissingQuestion(getDraft(callSid));
-            const line = nextQuestion
-              ? `Perfect. ${nextQuestion}`
-              : `Perfect.`;
+            const draftNow = getDraft(callSid);
+            const completeFromDraft = draftToBookAction(draftNow);
+            if (completeFromDraft) {
+              const bizViolation = getBusinessViolation(completeFromDraft.datetime);
+              if (bizViolation === "closed_day") {
+                const line = "We're closed on Sundays. What day works for you Monday through Saturday?";
+                const audio = await ttsWithRetry(line);
+                const id = uuidv4();
+                audioStore.set(id, audio);
+
+                setDraft(callSid, { datetime: "", date: "", time: null });
+                entry.ready = true;
+                entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
+</Response>`;
+                return;
+              }
+              if (bizViolation === "outside_hours") {
+                const line = "We book between 9 AM and 5 PM. What time in that window works for you?";
+                const audio = await ttsWithRetry(line);
+                const id = uuidv4();
+                audioStore.set(id, audio);
+
+                const keepDate = isoToDateOnly(completeFromDraft.datetime) || draftNow.date || "";
+                setDraft(callSid, { datetime: "", date: keepDate, time: null });
+                entry.ready = true;
+                entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
+</Response>`;
+                return;
+              }
+
+              completeFromDraft._createdAt = Date.now();
+              pendingBookings.set(callSid, completeFromDraft);
+              const pretty = formatTorontoConfirm(completeFromDraft.datetime) || completeFromDraft.datetime;
+              const confirmLine = `Just to confirm: a ${completeFromDraft.service} with ${completeFromDraft.stylist} on ${pretty}, correct?`;
+
+              const audio = await ttsWithRetry(confirmLine);
+              const id = uuidv4();
+              audioStore.set(id, audio);
+
+              entry.ready = true;
+              entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
+</Response>`;
+              return;
+            }
+
+            const nextQuestion = getNextMissingQuestion(draftNow);
+            const line = nextQuestion ? `Perfect. ${nextQuestion}` : "Perfect. How can I help with the booking?";
             const audio = await ttsWithRetry(line);
             const id = uuidv4();
             audioStore.set(id, audio);
