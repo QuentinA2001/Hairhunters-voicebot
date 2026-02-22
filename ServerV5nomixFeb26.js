@@ -952,7 +952,7 @@ app.post("/voice/incoming", async (req, res) => {
   const actionUrl = `${host}/voice/turn`;
 
   try {
-    const greet = `Hi this ${process.env.SALON_NAME || "the salon"}. My name is Alex, how can I help you?`;
+    const greet = `Hi, this is ${process.env.SALON_NAME || "the salon"}. My name is Alex, how can I help you?`;
     const audio = await ttsWithRetry(greet);
     const id = uuidv4();
     audioStore.set(id, audio);
