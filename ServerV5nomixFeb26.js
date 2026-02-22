@@ -2075,6 +2075,9 @@ If no year is specified, assume the next upcoming future date.
             spoken = getNextMissingQuestion(latestDraft) || "What detail should I update for the booking?";
           }
         }
+        if (latestDraft.name && assistantSeemsToAskForName(spoken)) {
+          spoken = getNextMissingQuestion(latestDraft) || "Perfect.";
+        }
         if (latestDraft.datetime && assistantSeemsToAskForTime(spoken)) {
           spoken = getNextMissingQuestion(latestDraft) || "Great. What’s your name for the booking?";
         }
