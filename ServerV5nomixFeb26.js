@@ -205,6 +205,50 @@ function extractServiceFromSpeech(text) {
   return null;
 }
 
+function titleCaseName(name) {
+  return String(name || "")
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .join(" ")
+    .trim();
+}
+
+function extractNameFromSpeech(text, opts = {}) {
+  const raw = String(text || "").trim();
+  if (!raw) return null;
+
+  const t = cleanSpeech(raw);
+  if (!t) return null;
+  if (/\d/.test(raw)) return null;
+  if (extractLikelyPhoneFromSpeech(raw).length >= 7) return null;
+  if (extractStylistFromSpeech(raw) || extractServiceFromSpeech(raw)) return null;
+  if (detectWeekday(raw) || hasNextWeekOnlyIntent(raw) || hasForwardWeekdayIntent(raw)) return null;
+  if (extractTimeOnly(raw) || extractTimeFromSpeech(raw)) return null;
+  if (DATE_WORD_RE.test(t)) return null;
+
+  const explicit =
+    raw.match(/\b(?:my name is|name is|this is|i am|i'm|it is|it's)\s+([a-z][a-z' -]{0,40})\b/i) ||
+    raw.match(/\b(?:its|it s)\s+([a-z][a-z' -]{0,40})\b/i);
+  if (explicit?.[1]) {
+    const candidate = titleCaseName(explicit[1].replace(/[^a-z' -]/gi, " ").replace(/\s+/g, " ").trim());
+    if (candidate && candidate.split(" ").length <= 3) return candidate;
+  }
+
+  if (!opts.expectingName) return null;
+
+  let candidate = t
+    .replace(/\b(?:um|uh|yeah|yes|ok|okay|sure|its|it s|it is|it's|i am|i m|my name is|name is|this is)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!candidate) return null;
+  if (!/^[a-z' -]{2,40}$/.test(candidate)) return null;
+  if (candidate.split(" ").length > 3) return null;
+
+  return titleCaseName(candidate);
+}
+
 function extractTimeOnly(text) {
   const t = cleanSpeech(text);
   if (!t) return null;
@@ -770,6 +814,8 @@ app.post("/voice/turn", async (req, res) => {
         : null;
     const isAmbiguousNextWeekOnly = hasNextWeekOnlyIntent(t) && !contextDateForCorrection;
     const spokenTime = extractTimeOnly(userSpeech) || extractTimeFromSpeech(userSpeech);
+    const expectingNameNow = !draftAtTurnStart.name && getNextMissingQuestion(draftAtTurnStart) === "Can I get your name for the booking?";
+    const foundName = extractNameFromSpeech(userSpeech, { expectingName: expectingNameNow });
 
     // Server-owned slot extraction on every utterance
     let foundDateOnly = resolveDateOnlyISO(userSpeech, { afterDateISO: contextDateForCorrection });
@@ -779,6 +825,7 @@ app.post("/voice/turn", async (req, res) => {
     if (foundStylist) speechPatch.stylist = foundStylist;
     if (foundService) speechPatch.service = foundService;
     if (spokenTime) speechPatch.time = spokenTime;
+    if (foundName && (!draftAtTurnStart.name || expectingNameNow)) speechPatch.name = foundName;
     if (foundDateOnly) {
       speechPatch.date = foundDateOnly;
       lastResolvedDateStore.set(callSid, foundDateOnly);
