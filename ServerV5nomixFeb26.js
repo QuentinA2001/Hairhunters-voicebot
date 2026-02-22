@@ -34,6 +34,7 @@ const CLOSED_WEEKDAY = 7;       // Sunday in Luxon (Mon=1..Sun=7)
 const ELEVEN_STABILITY = Number(process.env.ELEVEN_STABILITY || "0.55");
 const ELEVEN_SIMILARITY = Number(process.env.ELEVEN_SIMILARITY || "0.75");
 const DEFAULT_SERVICE_DURATION_MIN = Number(process.env.DEFAULT_SERVICE_DURATION_MIN || "60");
+const SLOT_STEP_MIN = Number(process.env.SLOT_STEP_MIN || "30");
 
 // In-memory stores (OK for MVP; use Redis/S3 for production)
 const audioStore = new Map();            // id -> Buffer(mp3)
@@ -663,6 +664,20 @@ function asksWhatDate(text) {
   return /\b(what|which|when)\b/.test(t) && /\b(date|day|weekday)\b/.test(t);
 }
 
+function asksAvailableTimesOnDay(text) {
+  const t = cleanSpeech(text);
+  if (!t) return false;
+  if (!/\b(time|times|availability|available|open)\b/.test(t)) return false;
+  if (!/\b(other|else|what|which|any)\b/.test(t)) return false;
+  return (
+    /\bwhat\s+(?:other\s+)?times?\s+(?:are\s+)?(?:available|open)\b/.test(t) ||
+    /\bwhat\s+else\s+is\s+available\b/.test(t) ||
+    /\bany\s+other\s+times?\b/.test(t) ||
+    /\bother\s+times?\s+(?:that\s+day|on\s+that\s+day|on\s+that\s+date|that\s+date)\b/.test(t) ||
+    /\bavailability\s+(?:for|on)\s+that\s+(?:day|date)\b/.test(t)
+  );
+}
+
 function formatTorontoDateOnly(dateISO) {
   const d = new Date(`${dateISO}T12:00:00`);
   if (isNaN(d.getTime())) return null;
@@ -900,6 +915,91 @@ async function checkGoogleCalendarAvailability(booking) {
     console.log("⚠️ Google Calendar availability check failed (blocking booking):", e?.message || e);
     return { enabled: true, available: false, reason: "api_error" };
   }
+}
+
+async function listGoogleCalendarAvailableTimesForDate({ dateISO, service }) {
+  const cfg = getGoogleCalendarConfig();
+  if (!cfg) return { enabled: false, ok: false, reason: "not_configured", slots: [] };
+
+  const day = DateTime.fromISO(`${String(dateISO || "")}T00:00:00`, { zone: BOT_TZ });
+  if (!day.isValid) return { enabled: true, ok: false, reason: "invalid_date", slots: [] };
+  if (day.weekday === CLOSED_WEEKDAY) return { enabled: true, ok: true, reason: "closed_day", slots: [] };
+
+  const durationMin = Math.max(15, Number(getServiceDurationMinutes(service) || DEFAULT_SERVICE_DURATION_MIN));
+  const stepMin = Math.max(15, Number(SLOT_STEP_MIN || 30));
+  const openDt = day.set({ hour: BUSINESS_OPEN_HOUR, minute: 0, second: 0, millisecond: 0 });
+  const closeDt = day.set({ hour: BUSINESS_CLOSE_HOUR, minute: 0, second: 0, millisecond: 0 });
+  const latestStart = closeDt.minus({ minutes: durationMin });
+  if (latestStart < openDt) return { enabled: true, ok: true, reason: "no_capacity", slots: [] };
+
+  try {
+    const auth = new google.auth.GoogleAuth({
+      credentials: cfg.credentials,
+      scopes: ["https://www.googleapis.com/auth/calendar.readonly"],
+    });
+    const calendar = google.calendar({ version: "v3", auth });
+    const resp = await calendar.freebusy.query({
+      requestBody: {
+        timeMin: openDt.toUTC().toISO(),
+        timeMax: closeDt.toUTC().toISO(),
+        timeZone: BOT_TZ,
+        items: [{ id: cfg.calendarId }],
+      },
+    });
+
+    const calBlock = resp?.data?.calendars?.[cfg.calendarId];
+    const calErrors = Array.isArray(calBlock?.errors) ? calBlock.errors : [];
+    if (!calBlock) return { enabled: true, ok: false, reason: "calendar_missing", slots: [] };
+    if (calErrors.length) return { enabled: true, ok: false, reason: "calendar_error", slots: [] };
+
+    const busy = (Array.isArray(calBlock?.busy) ? calBlock.busy : [])
+      .map((b) => ({
+        start: DateTime.fromISO(String(b.start || ""), { zone: BOT_TZ }),
+        end: DateTime.fromISO(String(b.end || ""), { zone: BOT_TZ }),
+      }))
+      .filter((b) => b.start.isValid && b.end.isValid && b.end > b.start);
+
+    const now = DateTime.now().setZone(BOT_TZ);
+    let slot = openDt;
+    if (day.hasSame(now, "day") && slot < now) {
+      const minsSinceOpen = Math.max(0, Math.ceil(now.diff(openDt, "minutes").minutes));
+      const snapped = Math.ceil(minsSinceOpen / stepMin) * stepMin;
+      slot = openDt.plus({ minutes: snapped });
+    }
+
+    const slots = [];
+    while (slot <= latestStart) {
+      const end = slot.plus({ minutes: durationMin });
+      const overlaps = busy.some((b) => slot < b.end && end > b.start);
+      if (!overlaps) slots.push(slot.toISO({ suppressMilliseconds: true, includeOffset: true }));
+      slot = slot.plus({ minutes: stepMin });
+      if (slots.length >= 12) break; // keep responses short
+    }
+
+    return { enabled: true, ok: true, reason: "ok", slots, durationMin };
+  } catch (e) {
+    console.log("⚠️ Google Calendar day availability list failed:", e?.message || e);
+    return { enabled: true, ok: false, reason: "api_error", slots: [] };
+  }
+}
+
+function formatAvailableTimeListLine(dateISO, slotIsos) {
+  const prettyDate = formatTorontoDateOnly(dateISO) || dateISO;
+  const labels = (slotIsos || [])
+    .map((iso) => formatTimeForSpeechFromISO(iso))
+    .filter(Boolean);
+
+  if (!labels.length) {
+    return `I do not have any open times left on ${prettyDate}. What other day works for you?`;
+  }
+
+  const top = labels.slice(0, 6);
+  let joined = "";
+  if (top.length === 1) joined = top[0];
+  else if (top.length === 2) joined = `${top[0]} or ${top[1]}`;
+  else joined = `${top.slice(0, -1).join(", ")}, or ${top[top.length - 1]}`;
+
+  return `On ${prettyDate}, I have ${joined} available. What time works for you?`;
 }
 
 function calendarUnavailableLine(availability, stale = false) {
@@ -1308,6 +1408,55 @@ If no year is specified, assume the next upcoming future date.
 </Response>`;
             return;
           }
+        }
+
+        if (asksAvailableTimesOnDay(userSpeech)) {
+          const draftNow = getDraft(callSid);
+          const pendingNow = pendingBookings.get(callSid);
+          const targetDate =
+            draftNow.date ||
+            lastResolvedDateStore.get(callSid) ||
+            isoToDateOnly(draftNow.datetime || pendingNow?.datetime);
+          const targetService = draftNow.service || pendingNow?.service || "";
+
+          if (!targetDate) {
+            const line = "I can check that once I have the day. What day were you looking for?";
+            const audio = await ttsWithRetry(line);
+            const id = uuidv4();
+            audioStore.set(id, audio);
+
+            entry.ready = true;
+            entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
+</Response>`;
+            return;
+          }
+
+          const dayAvailability = await listGoogleCalendarAvailableTimesForDate({
+            dateISO: targetDate,
+            service: targetService,
+          });
+
+          let line;
+          if (!dayAvailability.ok) {
+            line = "I could not verify the calendar right now. Please try another time, or I can connect you to the salon.";
+          } else if (dayAvailability.reason === "closed_day") {
+            line = "We are closed on Sundays. What other day works for you?";
+          } else {
+            line = formatAvailableTimeListLine(targetDate, dayAvailability.slots);
+          }
+
+          const audio = await ttsWithRetry(line);
+          const id = uuidv4();
+          audioStore.set(id, audio);
+
+          entry.ready = true;
+          entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
+</Response>`;
+          return;
         }
 
         const pendingBooking = pendingBookings.get(callSid);
