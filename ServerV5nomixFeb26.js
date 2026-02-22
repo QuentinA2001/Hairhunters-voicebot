@@ -26,6 +26,9 @@ const BASE_URL = process.env.BASE_URL || "";
 
 // ✅ NEW: timezone config (set BOT_TIMEZONE in Render if you want)
 const BOT_TZ = process.env.BOT_TIMEZONE || "America/Toronto";
+const BUSINESS_OPEN_HOUR = 9;   // 9:00 AM
+const BUSINESS_CLOSE_HOUR = 17; // 5:00 PM
+const CLOSED_WEEKDAY = 7;       // Sunday in Luxon (Mon=1..Sun=7)
 
 // In-memory stores (OK for MVP; use Redis/S3 for production)
 const audioStore = new Map();            // id -> Buffer(mp3)
@@ -75,6 +78,7 @@ IMPORTANT:
 - The server may append "(resolved date: YYYY-MM-DD)" or "(resolved datetime: YYYY-MM-DDTHH:mm:ss-05:00)" to caller turns.
 - Treat server-resolved date/datetime as ground truth.
 - If you only have a day (e.g., "next Tuesday") but no time, ask for the time.
+- Business hours are 9 AM to 5 PM, Monday through Saturday. Sunday is closed.
 
 - If caller asks for a human/manager/desk, respond with:
 ACTION_JSON: {"action":"transfer"}
@@ -258,6 +262,7 @@ function extractTimeOnly(text) {
   const allow = new Set([
     "at", "around", "for", "please", "pls", "ok", "okay", "works", "work", "that", "sounds", "good",
     "yes", "yeah", "yep", "yup", "ya", "y", "no", "nah", "nope", "um", "uh", "thanks", "thank", "you",
+    "o", "clock", "oclock",
   ]);
   const leftoversAllowed = (leftovers) =>
     !leftovers || leftovers.split(/\s+/).every((w) => allow.has(w));
@@ -279,7 +284,7 @@ function extractTimeOnly(text) {
   const ampm = m[3] || null;
 
   if (!ampm) {
-    if (hour >= 1 && hour <= 7) hour += 12;
+    if (hour >= 1 && hour <= 8) hour += 12;
   } else {
     if (ampm === "pm" && hour !== 12) hour += 12;
     if (ampm === "am" && hour === 12) hour = 0;
@@ -297,13 +302,31 @@ function extractTimeFromSpeech(text) {
   if (results.length) {
     const kv = results[0]?.start?.knownValues || {};
     if ("hour" in kv || "minute" in kv) {
-      const hour = Number(kv.hour ?? 0);
+      let hour = Number(kv.hour ?? 0);
       const minute = Number(kv.minute ?? 0);
+      const hasMeridiem = ("meridiem" in kv) || /\b(a\.?m\.?|p\.?m\.?)\b/i.test(input);
+      if (!hasMeridiem && hour >= 1 && hour <= 8) hour += 12;
       if (!Number.isNaN(hour) && !Number.isNaN(minute)) return { hour, minute };
     }
   }
 
   return extractTimeOnly(input);
+}
+
+function getBusinessViolation(iso) {
+  const dt = DateTime.fromISO(String(iso || ""), { zone: BOT_TZ });
+  if (!dt.isValid) return "invalid";
+  if (dt.weekday === CLOSED_WEEKDAY) return "closed_day";
+  const mins = dt.hour * 60 + dt.minute;
+  const open = BUSINESS_OPEN_HOUR * 60;
+  const close = BUSINESS_CLOSE_HOUR * 60;
+  if (mins < open || mins > close) return "outside_hours";
+  return null;
+}
+
+function isClosedDateOnly(dateISO) {
+  const dt = DateTime.fromISO(`${String(dateISO || "")}T12:00:00`, { zone: BOT_TZ });
+  return dt.isValid ? dt.weekday === CLOSED_WEEKDAY : false;
 }
 
 function isoToDateOnly(iso) {
@@ -869,6 +892,19 @@ If no year is specified, assume the next upcoming future date.
     }
 
     if (finalResolvedISO) {
+      const violation = getBusinessViolation(finalResolvedISO);
+      if (violation === "closed_day" || violation === "outside_hours") {
+        finalResolvedISO = null;
+        if (violation === "closed_day") {
+          setDraft(callSid, { date: "", datetime: "", time: null });
+        } else {
+          const keepDate = foundDateOnly || draftAtTurnStart.date || isoToDateOnly(pendingAtTurnStart?.datetime) || "";
+          setDraft(callSid, { date: keepDate, datetime: "", time: null });
+        }
+      }
+    }
+
+    if (finalResolvedISO) {
       const dt = DateTime.fromISO(finalResolvedISO, { zone: BOT_TZ });
       if (dt.isValid) {
         foundDateOnly = dt.toFormat("yyyy-LL-dd");
@@ -925,6 +961,36 @@ If no year is specified, assume the next upcoming future date.
 
         if (isAmbiguousNextWeekOnly) {
           const line = "What day next week were you looking for?";
+          const audio = await ttsWithRetry(line);
+          const id = uuidv4();
+          audioStore.set(id, audio);
+
+          entry.ready = true;
+          entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
+</Response>`;
+          return;
+        }
+
+        if (foundDateOnly && !finalResolvedISO && isClosedDateOnly(foundDateOnly)) {
+          setDraft(callSid, { date: "", datetime: "" });
+          lastResolvedDateStore.delete(callSid);
+          const line = "We're closed on Sundays. What day works for you Monday through Saturday?";
+          const audio = await ttsWithRetry(line);
+          const id = uuidv4();
+          audioStore.set(id, audio);
+
+          entry.ready = true;
+          entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
+</Response>`;
+          return;
+        }
+
+        if (spokenTime && !finalResolvedISO && getDraft(callSid).date) {
+          const line = "We book between 9 AM and 5 PM. What time in that window works for you?";
           const audio = await ttsWithRetry(line);
           const id = uuidv4();
           audioStore.set(id, audio);
@@ -1291,6 +1357,37 @@ If no year is specified, assume the next upcoming future date.
         }
 
         if (isCompleteBooking(action)) {
+          const bizViolation = getBusinessViolation(action.datetime);
+          if (bizViolation === "closed_day") {
+            const line = "We're closed on Sundays. What day works for you Monday through Saturday?";
+            const audio = await ttsWithRetry(line);
+            const id = uuidv4();
+            audioStore.set(id, audio);
+
+            setDraft(callSid, { datetime: "", date: "", time: null });
+            entry.ready = true;
+            entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
+</Response>`;
+            return;
+          }
+          if (bizViolation === "outside_hours") {
+            const line = "We book between 9 AM and 5 PM. What time in that window works for you?";
+            const audio = await ttsWithRetry(line);
+            const id = uuidv4();
+            audioStore.set(id, audio);
+
+            const keepDate = isoToDateOnly(action.datetime) || getDraft(callSid).date || "";
+            setDraft(callSid, { datetime: "", date: keepDate, time: null });
+            entry.ready = true;
+            entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
+</Response>`;
+            return;
+          }
+
           action.phone = normalizePhone(action.phone) || action.phone;
           action._createdAt = Date.now();
           setDraft(callSid, {
