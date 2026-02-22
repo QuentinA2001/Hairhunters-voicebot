@@ -580,7 +580,7 @@ function formatTorontoDateOnly(dateISO) {
 function isYes(text) {
   const t = cleanSpeech(text);
   if (/\b(no|nope|nah|negative|not|dont|do not)\b/.test(t)) return false;
-  return /\b(yes|yeah|yep|yup|correct|right|exactly|confirm|confirmed|sure|okay|ok|sounds good|that works|go ahead|book it|do it|thats correct|that is correct|thats right|that is right)\b/.test(t);
+  return /\b(yes|yeah|yep|yup|correct|right|exactly|confirm|confirmed|sure|okay|ok|sounds good|that works|go ahead|book it|do it|thats correct|that is correct|thats right|that is right|thats good|that is good)\b/.test(t);
 }
 
 function isNo(text) {
@@ -625,6 +625,18 @@ function assistantSeemsToAskForTime(text) {
     /\bwhat\s+hour\b/.test(t) ||
     /\btime\s+(works|would work|is good|is best)\b/.test(t) ||
     /\bcan you give me a time\b/.test(t)
+  );
+}
+
+function assistantSeemsToRecapBooking(text) {
+  const t = cleanSpeech(text);
+  return (
+    /\bjust to confirm\b/.test(t) ||
+    /\bi have all the details\b/.test(t) ||
+    /\blet me confirm\b/.test(t) ||
+    /\bconfirming\b/.test(t) ||
+    /\byou re all set\b/.test(t) ||
+    /\bdoes that look right\b/.test(t)
   );
 }
 
@@ -1351,6 +1363,15 @@ If no year is specified, assume the next upcoming future date.
         let spoken = reply.replace(/ACTION_JSON:[\s\S]*$/, "").trim() || "Got it.";
         spoken = sanitizeSpoken(spoken);
         const latestDraft = getDraft(callSid);
+        if (!pendingBookings.get(callSid) && assistantSeemsToRecapBooking(spoken)) {
+          const fromDraft = draftToBookAction(latestDraft);
+          if (fromDraft) {
+            action = fromDraft;
+            spoken = "";
+          } else {
+            spoken = getNextMissingQuestion(latestDraft) || "What detail should I update for the booking?";
+          }
+        }
         if (latestDraft.datetime && assistantSeemsToAskForTime(spoken)) {
           spoken = getNextMissingQuestion(latestDraft) || "Great. What’s your name for the booking?";
         }
