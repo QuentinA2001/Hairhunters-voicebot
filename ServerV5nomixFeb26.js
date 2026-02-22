@@ -688,6 +688,22 @@ function asksAvailableTimesOnDay(text) {
   );
 }
 
+function soundsLikeAvailabilityFollowUp(text) {
+  const t = cleanSpeech(text);
+  if (!t) return false;
+  if (isYes(t) || isNo(t)) return false;
+  if (extractTimeOnly(t) || extractTimeFromSpeech(t)) return false;
+  return (
+    /\b(what|which|any|other|else|options?)\b/.test(t) &&
+      /\b(time|times|slot|slots|available|availabel|open|free|later|earlier)\b/.test(t)
+  ) || (
+    /\bdo you have\b/.test(t) &&
+      /\b(anything|something|times|slots?|open|available|later|earlier)\b/.test(t)
+  ) || (
+    /\bwhat else\b/.test(t)
+  );
+}
+
 function assistantSaidTimeUnavailable(text) {
   const t = cleanSpeech(text);
   if (!t) return false;
@@ -1439,9 +1455,19 @@ If no year is specified, assume the next upcoming future date.
         const availabilityFollowUpIntent =
           asksAvailableTimesOnDay(userSpeech) ||
           (Boolean(conflictCtx) &&
-            /\b(what|which|any|other|else|open|available|time|times|slot|slots|options?)\b/.test(cleanSpeech(userSpeech))) ||
+            soundsLikeAvailabilityFollowUp(userSpeech)) ||
           (assistantSaidTimeUnavailable(lastAssistantSpoken) &&
             /\b(what|which|any|other|else|open|available|time|times|slot|slots)\b/.test(cleanSpeech(userSpeech)));
+
+        if (conflictCtx) {
+          console.log("📅 availability follow-up check", {
+            callSid,
+            hasConflictCtx: true,
+            userSpeech,
+            availabilityFollowUpIntent,
+            conflictDate: conflictCtx.dateISO,
+          });
+        }
 
         if (availabilityFollowUpIntent) {
           const draftNow = getDraft(callSid);
