@@ -225,7 +225,6 @@ function extractNameFromSpeech(text, opts = {}) {
   const t = cleanSpeech(raw);
   if (!t) return null;
   if (isYes(t) || isNo(t)) return null;
-  if (/\d/.test(raw)) return null;
 
   const explicit =
     raw.match(/\b(?:my name is|name is|this is|i am|i'm|it is|it's)\s+([a-z][a-z' -]{0,40}?)(?=\s+(?:and|my|phone|number|for|to|with|at)\b|$)/i) ||
@@ -236,6 +235,7 @@ function extractNameFromSpeech(text, opts = {}) {
     if (candidate && !isYes(candidate) && !isNo(candidate)) return candidate;
   }
 
+  if (/\d/.test(raw)) return null;
   if (extractLikelyPhoneFromSpeech(raw).length >= 7) return null;
   if (extractStylistFromSpeech(raw) || extractServiceFromSpeech(raw)) return null;
   if (detectWeekday(raw) || hasNextWeekOnlyIntent(raw) || hasForwardWeekdayIntent(raw)) return null;
