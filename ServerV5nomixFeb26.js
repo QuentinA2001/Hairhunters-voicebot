@@ -697,6 +697,10 @@ function wantsHuman(text) {
 
 function sanitizeSpoken(text) {
   let out = String(text || "");
+  out = out.replace(/^\s*great choice[!. ,:-]*/i, "");
+  out = out.replace(/\b(?:okay|alright|sounds good)[!.]\s+great choice[!. ,:-]*/i, (m) =>
+    m.replace(/\s*great choice[!. ,:-]*/i, " ")
+  );
   out = out.replace(
     /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?[+-]\d{2}:\d{2}/g,
     (iso) => formatTorontoConfirm(iso) || "that time"
