@@ -569,8 +569,25 @@ function normalizePhone(s) {
   return digits;
 }
 
+function selectBestPhoneDigits(s) {
+  const digits = String(s || "").replace(/\D/g, "");
+  if (!digits) return "";
+  if (digits.length === 10) return digits;
+  if (digits.length === 11 && digits.startsWith("1")) return digits.slice(1);
+  if (digits.length > 10) {
+    for (let i = 0; i <= digits.length - 10; i += 1) {
+      const cand = digits.slice(i, i + 10);
+      if (/^[2-9]\d{9}$/.test(cand)) return cand;
+    }
+    const first10 = digits.slice(0, 10);
+    if (/^[2-9]\d{9}$/.test(first10)) return first10;
+    return digits.slice(-10);
+  }
+  return digits;
+}
+
 function isLikelyNorthAmericanPhone(s) {
-  const d = normalizePhone(s);
+  const d = selectBestPhoneDigits(s);
   // Keep this permissive enough for real-world test numbers, while rejecting obvious bad parses like 005...
   return /^\d{10}$/.test(d) && /^[2-9]\d{9}$/.test(d);
 }
@@ -780,8 +797,7 @@ function speakPartialDigits(digits) {
 function extractLikelyPhoneFromSpeech(speech) {
   const raw = String(speech || "").toLowerCase();
   const directDigits = raw.replace(/\D/g, "");
-  if (directDigits.length === 10) return directDigits;
-  if (directDigits.length > 10) return directDigits.slice(-10);
+  if (directDigits.length >= 10) return selectBestPhoneDigits(directDigits);
 
   const tokenMap = {
     zero: "0", oh: "0", o: "0",
@@ -822,11 +838,7 @@ function extractLikelyPhoneFromSpeech(speech) {
   if (!phoneContext && mappedCount < 7) return "";
   const digits = built.replace(/\D/g, "");
 
-  // prefer a clean 10-digit number if present anywhere
-  if (digits.length === 10) return digits;
-
-  // if longer, take last 10 (handles “+1 905...” etc)
-  if (digits.length > 10) return digits.slice(-10);
+  if (digits.length >= 10) return selectBestPhoneDigits(digits);
 
   // if shorter, return as-is (caller may be mid-number)
   return digits;
@@ -1400,10 +1412,10 @@ If no year is specified, assume the next upcoming future date.
           const shouldTreatAsPhone =
             expectingPhoneNow || hasPhoneIntent || previousPartial.length > 0 || maybePhoneDigits.length >= 7;
           if (shouldTreatAsPhone && maybePhoneDigits) {
-            const combined = normalizePhone(`${previousPartial}${maybePhoneDigits}`);
-            if (combined.length < 10) {
-              partialPhoneStore.set(callSid, combined);
-              const line = `I got ${speakPartialDigits(combined)}. Please say the remaining digits.`;
+            const combinedRaw = `${previousPartial}${maybePhoneDigits}`.replace(/\D/g, "");
+            if (combinedRaw.length < 10) {
+              partialPhoneStore.set(callSid, combinedRaw);
+              const line = `I got ${speakPartialDigits(combinedRaw)}. Please say the remaining digits.`;
               const audio = await ttsWithRetry(line);
               const id = uuidv4();
               audioStore.set(id, audio);
@@ -1416,7 +1428,7 @@ If no year is specified, assume the next upcoming future date.
               return;
             }
 
-            const cleanPhone = combined.slice(-10);
+            const cleanPhone = selectBestPhoneDigits(combinedRaw);
             partialPhoneStore.delete(callSid);
             if (!isLikelyNorthAmericanPhone(cleanPhone)) {
               const line = "That didn’t sound like a valid 10-digit number. Please say it again, one digit at a time.";
