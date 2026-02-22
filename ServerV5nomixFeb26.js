@@ -793,10 +793,6 @@ function speakDigits(digits) {
   return `${area}, ${mid}, ${tail}`;
 }
 
-function speakPartialDigits(digits) {
-  return normalizePhone(digits).split("").join(" ");
-}
-
 /**
  * Converts speech like:
  * "905 555 8851"
@@ -1430,10 +1426,25 @@ If no year is specified, assume the next upcoming future date.
           const shouldTreatAsPhone =
             expectingPhoneNow || hasPhoneIntent || previousPartial.length > 0 || maybePhoneDigits.length >= 7;
           if (shouldTreatAsPhone && maybePhoneDigits) {
+            const minimumChunk = previousPartial.length > 0 ? 1 : 3;
+            if (maybePhoneDigits.length < minimumChunk) {
+              const line = "Please say your full 10-digit phone number, one digit at a time.";
+              const audio = await ttsWithRetry(line);
+              const id = uuidv4();
+              audioStore.set(id, audio);
+
+              entry.ready = true;
+              entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
+</Response>`;
+              return;
+            }
+
             const combinedRaw = `${previousPartial}${maybePhoneDigits}`.replace(/\D/g, "");
             if (combinedRaw.length < 10) {
               partialPhoneStore.set(callSid, combinedRaw);
-              const line = `I got ${speakPartialDigits(combinedRaw)}. Please say the remaining digits.`;
+              const line = "Thanks. Please say the remaining digits.";
               const audio = await ttsWithRetry(line);
               const id = uuidv4();
               audioStore.set(id, audio);
