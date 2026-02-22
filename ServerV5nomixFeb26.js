@@ -825,6 +825,17 @@ function assistantSeemsToAskForName(text) {
   );
 }
 
+function assistantSeemsToAskForNameBroad(text) {
+  const t = cleanSpeech(text);
+  if (!t) return false;
+  if (!/\bname\b/.test(t)) return false;
+  return (
+    assistantSeemsToAskForName(t) ||
+    /\b(what|who|can|could)\b/.test(t) ||
+    /\b(your|booking|put.*under|speaking with)\b/.test(t)
+  );
+}
+
 function assistantSeemsToRecapBooking(text) {
   const t = cleanSpeech(text);
   return (
@@ -1332,6 +1343,15 @@ If no year is specified, assume the next upcoming future date.
       );
     const foundName = extractNameFromSpeech(userSpeech, { expectingName: expectingNameNow });
 
+    // Prevent stale partial phone digits from polluting a later full phone number.
+    // Keep the partial buffer only while we are actually on the phone step or awaiting phone confirmation.
+    if (!awaitingPhoneConfirm.has(callSid)) {
+      const nextMissingAtStart = getNextMissingQuestion(draftAtTurnStart);
+      if (nextMissingAtStart !== "What is the best 10 digit phone number for the booking?") {
+        partialPhoneStore.delete(callSid);
+      }
+    }
+
     // Server-owned slot extraction on every utterance
     let foundDateOnly = resolveDateOnlyISO(userSpeech, { afterDateISO: contextDateForCorrection });
     const speechPatch = {};
@@ -1763,6 +1783,17 @@ If no year is specified, assume the next upcoming future date.
           !draftForPhone.phone &&
           getNextMissingQuestion(draftForPhone) === "What is the best 10 digit phone number for the booking?";
         const hasPhoneIntent = /\b(phone|number|digits?)\b/.test(cleanSpeech(userSpeech));
+        if (maybePhoneDigits) {
+          console.log("📞 phone parse", {
+            callSid,
+            speech: String(userSpeech || "").slice(0, 80),
+            maybePhone,
+            maybePhoneDigits,
+            partial: partialPhoneStore.get(callSid) || "",
+            expectingPhoneNow,
+            hasPhoneIntent,
+          });
+        }
 
         // A) If we are waiting on "yes/no" to confirm phone
         if (awaitingPhoneConfirm.has(callSid)) {
@@ -2119,7 +2150,7 @@ If no year is specified, assume the next upcoming future date.
             spoken = getNextMissingQuestion(latestDraft) || "What detail should I update for the booking?";
           }
         }
-        if (latestDraft.name && assistantSeemsToAskForName(spoken)) {
+        if (latestDraft.name && assistantSeemsToAskForNameBroad(spoken)) {
           spoken = getNextMissingQuestion(latestDraft) || "Perfect.";
         }
         if (latestDraft.datetime && assistantSeemsToAskForTime(spoken)) {
