@@ -42,7 +42,7 @@ const http = axios.create({ httpsAgent, timeout: 12000 });
 const pick = (v) => (v ? String(v).slice(0, 6) + "…" : "missing");
 
 // ---------- FILLERS (pre-generated ElevenLabs clips) ----------
-const fillerText = ["One sec.", "Got it.", "Okay.", "Alright."];
+const fillerText = ["Just a moment.", "Got it.", "Okay.", "All right."];
 const fillerIds = []; // mp3 ids ready to use
 
 const clipIds = {
@@ -543,6 +543,10 @@ function sanitizeSpoken(text) {
     if (!mm) return `${h} ${suffix}`;
     return `${h}:${mm} ${suffix}`;
   });
+  out = out.replace(/\b(\d{1,2})\s+long\s*(AM|PM)\b/gi, "$1 $2");
+  // Avoid ":" pronunciation artifacts in TTS ("4:00 PM" -> "4 PM", "4:30 PM" -> "4 30 PM")
+  out = out.replace(/\b(\d{1,2}):00\s*(AM|PM)\b/g, "$1 $2");
+  out = out.replace(/\b(\d{1,2}):([0-5]\d)\s*(AM|PM)\b/g, "$1 $2 $3");
   out = out.replace(/\s+/g, " ").trim();
   return out;
 }
@@ -570,11 +574,11 @@ function mergeBookActionWithDraft(action, draft) {
   if (!action || action.action !== "book") return action;
   return {
     action: "book",
-    service: action.service || draft.service || "",
-    stylist: action.stylist || draft.stylist || "",
-    datetime: action.datetime || draft.datetime || "",
-    name: action.name || draft.name || "",
-    phone: normalizePhone(action.phone || draft.phone || ""),
+    service: draft.service || action.service || "",
+    stylist: draft.stylist || action.stylist || "",
+    datetime: draft.datetime || action.datetime || "",
+    name: draft.name || action.name || "",
+    phone: normalizePhone(draft.phone || action.phone || ""),
   };
 }
 
@@ -1152,14 +1156,19 @@ If no year is specified, assume the next upcoming future date.
 
         let action = extractAction(reply);
         if (action?.action === "book") {
-          action = mergeBookActionWithDraft(action, getDraft(callSid));
+          const draftBeforeActionMerge = getDraft(callSid);
+          action = mergeBookActionWithDraft(action, draftBeforeActionMerge);
 
           const patchFromAction = {};
           if (action.service) patchFromAction.service = action.service;
           if (action.stylist) patchFromAction.stylist = action.stylist;
           if (action.name) patchFromAction.name = action.name;
           if (action.phone) patchFromAction.phone = normalizePhone(action.phone) || action.phone;
-          if (action.datetime) {
+          const shouldAcceptActionDatetime = Boolean(
+            action.datetime &&
+            (!draftBeforeActionMerge.datetime || finalResolvedISO)
+          );
+          if (shouldAcceptActionDatetime) {
             patchFromAction.datetime = action.datetime;
             const adt = DateTime.fromISO(action.datetime, { zone: BOT_TZ });
             if (adt.isValid) {
