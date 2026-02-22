@@ -1475,7 +1475,9 @@ If no year is specified, assume the next upcoming future date.
           const currentFullPhone = isLikelyNorthAmericanPhone(maybePhoneDigits)
             ? normalizePhone(maybePhoneDigits)
             : "";
-          const previousPartial = currentFullPhone ? "" : (partialPhoneStore.get(callSid) || "");
+          const treatAsFreshAttempt = maybePhoneDigits.length >= 9;
+          if (treatAsFreshAttempt) partialPhoneStore.delete(callSid);
+          const previousPartial = (currentFullPhone || treatAsFreshAttempt) ? "" : (partialPhoneStore.get(callSid) || "");
           const shouldTreatAsPhone =
             expectingPhoneNow || hasPhoneIntent || previousPartial.length > 0 || maybePhoneDigits.length >= 7;
           if (shouldTreatAsPhone && maybePhoneDigits) {
