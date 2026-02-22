@@ -680,6 +680,16 @@ function assistantSeemsToAskForTime(text) {
   );
 }
 
+function assistantSeemsToAskForName(text) {
+  const t = cleanSpeech(text);
+  return (
+    /\bwhat(?:s| is)?\s+your\s+name\b/.test(t) ||
+    /\bcan i get your name\b/.test(t) ||
+    /\bname\s+for\s+the\s+booking\b/.test(t) ||
+    /\bwho\s+should\s+i\s+put\s+the\s+booking\s+under\b/.test(t)
+  );
+}
+
 function assistantSeemsToRecapBooking(text) {
   const t = cleanSpeech(text);
   return (
@@ -920,33 +930,6 @@ app.post("/voice/turn", async (req, res) => {
   try {
     const callSid = req.body.CallSid || "no-callsid";
     const userSpeech = req.body.SpeechResult || "";
-    const draftAtTurnStart = getDraft(callSid);
-    const pendingAtTurnStart = pendingBookings.get(callSid);
-    const t = cleanSpeech(userSpeech);
-    const hasForwardDateIntent = hasForwardWeekdayIntent(t) || hasNextWeekOnlyIntent(t);
-    const contextDateForCorrection =
-      hasForwardDateIntent
-        ? (draftAtTurnStart.date || isoToDateOnly(pendingAtTurnStart?.datetime))
-        : null;
-    const isAmbiguousNextWeekOnly = hasNextWeekOnlyIntent(t) && !contextDateForCorrection;
-    const spokenTime = extractTimeOnly(userSpeech) || extractTimeFromSpeech(userSpeech);
-    const expectingNameNow = !draftAtTurnStart.name && getNextMissingQuestion(draftAtTurnStart) === "Can I get your name for the booking?";
-    const foundName = extractNameFromSpeech(userSpeech, { expectingName: expectingNameNow });
-
-    // Server-owned slot extraction on every utterance
-    let foundDateOnly = resolveDateOnlyISO(userSpeech, { afterDateISO: contextDateForCorrection });
-    const speechPatch = {};
-    const foundStylist = extractStylistFromSpeech(userSpeech);
-    const foundService = extractServiceFromSpeech(userSpeech);
-    if (foundStylist) speechPatch.stylist = foundStylist;
-    if (foundService) speechPatch.service = foundService;
-    if (spokenTime) speechPatch.time = spokenTime;
-    if (foundName && (!draftAtTurnStart.name || expectingNameNow)) speechPatch.name = foundName;
-    if (foundDateOnly) {
-      speechPatch.date = foundDateOnly;
-      lastResolvedDateStore.set(callSid, foundDateOnly);
-    }
-    if (Object.keys(speechPatch).length) setDraft(callSid, speechPatch);
 
     if (!conversationStore.has(callSid)) {
       conversationStore.set(callSid, [
@@ -964,8 +947,43 @@ If no year is specified, assume the next upcoming future date.
         },
       ]);
     }
-
     const messages = conversationStore.get(callSid);
+
+    const draftAtTurnStart = getDraft(callSid);
+    const pendingAtTurnStart = pendingBookings.get(callSid);
+    const t = cleanSpeech(userSpeech);
+    const hasForwardDateIntent = hasForwardWeekdayIntent(t) || hasNextWeekOnlyIntent(t);
+    const contextDateForCorrection =
+      hasForwardDateIntent
+        ? (draftAtTurnStart.date || isoToDateOnly(pendingAtTurnStart?.datetime))
+        : null;
+    const isAmbiguousNextWeekOnly = hasNextWeekOnlyIntent(t) && !contextDateForCorrection;
+    const spokenTime = extractTimeOnly(userSpeech) || extractTimeFromSpeech(userSpeech);
+    const lastAssistantPrompt =
+      [...messages].reverse().find((m) => m?.role === "assistant")?.content || "";
+    const expectingNameNow =
+      !draftAtTurnStart.name &&
+      (
+        getNextMissingQuestion(draftAtTurnStart) === "Can I get your name for the booking?" ||
+        assistantSeemsToAskForName(lastAssistantPrompt)
+      );
+    const foundName = extractNameFromSpeech(userSpeech, { expectingName: expectingNameNow });
+
+    // Server-owned slot extraction on every utterance
+    let foundDateOnly = resolveDateOnlyISO(userSpeech, { afterDateISO: contextDateForCorrection });
+    const speechPatch = {};
+    const foundStylist = extractStylistFromSpeech(userSpeech);
+    const foundService = extractServiceFromSpeech(userSpeech);
+    if (foundStylist) speechPatch.stylist = foundStylist;
+    if (foundService) speechPatch.service = foundService;
+    if (spokenTime) speechPatch.time = spokenTime;
+    if (foundName && (!draftAtTurnStart.name || expectingNameNow)) speechPatch.name = foundName;
+    if (foundDateOnly) {
+      speechPatch.date = foundDateOnly;
+      lastResolvedDateStore.set(callSid, foundDateOnly);
+    }
+    if (Object.keys(speechPatch).length) setDraft(callSid, speechPatch);
+
     let finalResolvedISO = resolveDateToISO(userSpeech, { afterDateISO: contextDateForCorrection });
 
     if (!finalResolvedISO) {
