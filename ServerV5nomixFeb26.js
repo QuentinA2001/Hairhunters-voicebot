@@ -224,6 +224,7 @@ function extractNameFromSpeech(text, opts = {}) {
 
   const t = cleanSpeech(raw);
   if (!t) return null;
+  if (isYes(t) || isNo(t)) return null;
   if (/\d/.test(raw)) return null;
   if (extractLikelyPhoneFromSpeech(raw).length >= 7) return null;
   if (extractStylistFromSpeech(raw) || extractServiceFromSpeech(raw)) return null;
@@ -232,11 +233,12 @@ function extractNameFromSpeech(text, opts = {}) {
   if (DATE_WORD_RE.test(t)) return null;
 
   const explicit =
-    raw.match(/\b(?:my name is|name is|this is|i am|i'm|it is|it's)\s+([a-z][a-z' -]{0,40})\b/i) ||
-    raw.match(/\b(?:its|it s)\s+([a-z][a-z' -]{0,40})\b/i);
+    raw.match(/\b(?:my name is|name is|this is|i am|i'm|it is|it's)\s+([a-z][a-z' -]{0,40}?)(?=\s+(?:and|my|phone|number|for|to|with|at)\b|$)/i) ||
+    raw.match(/\b(?:its|it s)\s+([a-z][a-z' -]{0,40}?)(?=\s+(?:and|my|phone|number|for|to|with|at)\b|$)/i);
   if (explicit?.[1]) {
-    const candidate = titleCaseName(explicit[1].replace(/[^a-z' -]/gi, " ").replace(/\s+/g, " ").trim());
-    if (candidate && candidate.split(" ").length <= 3) return candidate;
+    const clipped = explicit[1].replace(/[^a-z' -]/gi, " ").replace(/\s+/g, " ").trim().split(" ").slice(0, 3).join(" ");
+    const candidate = titleCaseName(clipped);
+    if (candidate && !isYes(candidate) && !isNo(candidate)) return candidate;
   }
 
   if (!opts.expectingName) return null;
@@ -248,7 +250,8 @@ function extractNameFromSpeech(text, opts = {}) {
 
   if (!candidate) return null;
   if (!/^[a-z' -]{2,40}$/.test(candidate)) return null;
-  if (candidate.split(" ").length > 3) return null;
+  candidate = candidate.split(" ").slice(0, 3).join(" ");
+  if (isYes(candidate) || isNo(candidate)) return null;
 
   return titleCaseName(candidate);
 }
