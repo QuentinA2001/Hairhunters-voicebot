@@ -695,6 +695,7 @@ function setDraft(callSid, patch) {
 function draftSummarySystem(draft) {
   const parts = [];
   if (draft.date) parts.push(`date="${draft.date}"`);
+  if (draft.time) parts.push(`time="${String(draft.time.hour).padStart(2, "0")}:${String(draft.time.minute).padStart(2, "0")}"`);
   if (draft.name) parts.push(`name="${draft.name}"`);
   if (draft.phone) parts.push(`phone="${draft.phone}"`);
   if (draft.service) parts.push(`service="${draft.service}"`);
@@ -739,14 +740,14 @@ app.post("/voice/incoming", async (req, res) => {
     return res.type("text/xml").send(
 `<Response>
   <Play>${host}/audio/${id}.mp3</Play>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
 </Response>`
     );
   } catch {
     return res.type("text/xml").send(
 `<Response>
   <Say>Hi! Thanks for calling. How can I help you today?</Say>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
 </Response>`
     );
   }
@@ -768,6 +769,7 @@ app.post("/voice/turn", async (req, res) => {
         ? (draftAtTurnStart.date || isoToDateOnly(pendingAtTurnStart?.datetime))
         : null;
     const isAmbiguousNextWeekOnly = hasNextWeekOnlyIntent(t) && !contextDateForCorrection;
+    const spokenTime = extractTimeOnly(userSpeech) || extractTimeFromSpeech(userSpeech);
 
     // Server-owned slot extraction on every utterance
     let foundDateOnly = resolveDateOnlyISO(userSpeech, { afterDateISO: contextDateForCorrection });
@@ -776,6 +778,7 @@ app.post("/voice/turn", async (req, res) => {
     const foundService = extractServiceFromSpeech(userSpeech);
     if (foundStylist) speechPatch.stylist = foundStylist;
     if (foundService) speechPatch.service = foundService;
+    if (spokenTime) speechPatch.time = spokenTime;
     if (foundDateOnly) {
       speechPatch.date = foundDateOnly;
       lastResolvedDateStore.set(callSid, foundDateOnly);
@@ -804,7 +807,7 @@ If no year is specified, assume the next upcoming future date.
 
     if (!finalResolvedISO) {
       const draft = getDraft(callSid);
-      const timeOnly = extractTimeOnly(userSpeech);
+      const timeOnly = spokenTime || draft.time || isoToTimeOnly(draft.datetime || pendingAtTurnStart?.datetime);
       if (draft?.date && timeOnly) {
         finalResolvedISO = buildISOFromDateAndTime(draft.date, timeOnly);
       }
@@ -822,7 +825,7 @@ If no year is specified, assume the next upcoming future date.
       const dt = DateTime.fromISO(finalResolvedISO, { zone: BOT_TZ });
       if (dt.isValid) {
         foundDateOnly = dt.toFormat("yyyy-LL-dd");
-        setDraft(callSid, { date: foundDateOnly, datetime: finalResolvedISO });
+        setDraft(callSid, { date: foundDateOnly, datetime: finalResolvedISO, time: { hour: dt.hour, minute: dt.minute } });
         lastResolvedDateStore.set(callSid, foundDateOnly);
       } else {
         setDraft(callSid, { datetime: finalResolvedISO });
@@ -855,6 +858,24 @@ If no year is specified, assume the next upcoming future date.
       if (!entry) return;
 
       try {
+        if (!cleanSpeech(userSpeech)) {
+          const pendingBooking = pendingBookings.get(callSid);
+          const draftNow = getDraft(callSid);
+          const line = pendingBooking
+            ? "I'm still here. Are these booking details correct?"
+            : (getNextMissingQuestion(draftNow) || "I'm still here whenever you're ready.");
+          const audio = await ttsWithRetry(line);
+          const id = uuidv4();
+          audioStore.set(id, audio);
+
+          entry.ready = true;
+          entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
+</Response>`;
+          return;
+        }
+
         if (isAmbiguousNextWeekOnly) {
           const line = "What day next week were you looking for?";
           const audio = await ttsWithRetry(line);
@@ -864,7 +885,7 @@ If no year is specified, assume the next upcoming future date.
           entry.ready = true;
           entry.twiml = `<Response>
   <Play>${host}/audio/${id}.mp3</Play>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
 </Response>`;
           return;
         }
@@ -882,7 +903,7 @@ If no year is specified, assume the next upcoming future date.
             entry.ready = true;
             entry.twiml = `<Response>
   <Play>${host}/audio/${id}.mp3</Play>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
 </Response>`;
             return;
           }
@@ -926,7 +947,7 @@ If no year is specified, assume the next upcoming future date.
             entry.ready = true;
             entry.twiml = `<Response>
   <Play>${host}/audio/${id}.mp3</Play>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
 </Response>`;
             return;
           }
@@ -951,6 +972,7 @@ If no year is specified, assume the next upcoming future date.
           if (changed && corrected.datetime) {
             corrected._createdAt = Date.now();
             pendingBookings.set(callSid, corrected);
+            const correctedTime = isoToTimeOnly(corrected.datetime);
             setDraft(callSid, {
               service: corrected.service,
               stylist: corrected.stylist,
@@ -958,6 +980,7 @@ If no year is specified, assume the next upcoming future date.
               name: corrected.name,
               phone: corrected.phone,
               date: isoToDateOnly(corrected.datetime) || draftNow.date,
+              time: correctedTime || draftNow.time,
             });
 
             const pretty = formatTorontoConfirm(corrected.datetime) || corrected.datetime;
@@ -969,7 +992,7 @@ If no year is specified, assume the next upcoming future date.
             entry.ready = true;
             entry.twiml = `<Response>
   <Play>${host}/audio/${id}.mp3</Play>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
 </Response>`;
             return;
           }
@@ -982,7 +1005,7 @@ If no year is specified, assume the next upcoming future date.
           entry.ready = true;
           entry.twiml = `<Response>
   <Play>${host}/audio/${id}.mp3</Play>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
 </Response>`;
           return;
         }
@@ -1005,6 +1028,7 @@ If no year is specified, assume the next upcoming future date.
           if (changed && corrected.datetime) {
             corrected._createdAt = Date.now();
             pendingBookings.set(callSid, corrected);
+            const correctedTime = isoToTimeOnly(corrected.datetime);
             setDraft(callSid, {
               service: corrected.service,
               stylist: corrected.stylist,
@@ -1012,6 +1036,7 @@ If no year is specified, assume the next upcoming future date.
               name: corrected.name,
               phone: corrected.phone,
               date: isoToDateOnly(corrected.datetime) || draftNow.date,
+              time: correctedTime || draftNow.time,
             });
 
             const pretty = formatTorontoConfirm(corrected.datetime) || corrected.datetime;
@@ -1023,7 +1048,7 @@ If no year is specified, assume the next upcoming future date.
             entry.ready = true;
             entry.twiml = `<Response>
   <Play>${host}/audio/${id}.mp3</Play>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
 </Response>`;
             return;
           }
@@ -1062,7 +1087,7 @@ If no year is specified, assume the next upcoming future date.
             entry.ready = true;
             entry.twiml = `<Response>
   <Play>${host}/audio/${id}.mp3</Play>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
 </Response>`;
             return;
           }
@@ -1078,7 +1103,7 @@ If no year is specified, assume the next upcoming future date.
             entry.ready = true;
             entry.twiml = `<Response>
   <Play>${host}/audio/${id}.mp3</Play>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
 </Response>`;
             return;
           }
@@ -1092,7 +1117,7 @@ If no year is specified, assume the next upcoming future date.
           entry.ready = true;
           entry.twiml = `<Response>
   <Play>${host}/audio/${id}.mp3</Play>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
 </Response>`;
           return;
         }
@@ -1109,7 +1134,7 @@ If no year is specified, assume the next upcoming future date.
           entry.ready = true;
           entry.twiml = `<Response>
   <Play>${host}/audio/${id}.mp3</Play>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
 </Response>`;
           return;
         }
@@ -1174,6 +1199,7 @@ If no year is specified, assume the next upcoming future date.
             if (adt.isValid) {
               const d = adt.toFormat("yyyy-LL-dd");
               patchFromAction.date = d;
+              patchFromAction.time = { hour: adt.hour, minute: adt.minute };
               lastResolvedDateStore.set(callSid, d);
             }
           }
@@ -1226,6 +1252,7 @@ If no year is specified, assume the next upcoming future date.
             datetime: action.datetime,
             name: action.name,
             phone: action.phone,
+            time: isoToTimeOnly(action.datetime),
           });
           pendingBookings.set(callSid, action);
 
@@ -1239,7 +1266,7 @@ If no year is specified, assume the next upcoming future date.
           entry.ready = true;
           entry.twiml = `<Response>
   <Play>${host}/audio/${id}.mp3</Play>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
 </Response>`;
           return;
         }
@@ -1251,7 +1278,7 @@ If no year is specified, assume the next upcoming future date.
         entry.ready = true;
         entry.twiml = `<Response>
   <Play>${host}/audio/${id}.mp3</Play>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
 </Response>`;
       } catch (e) {
         console.log("❌ Background turn error", e?.stack || e?.message || e);
@@ -1260,7 +1287,7 @@ If no year is specified, assume the next upcoming future date.
         entry.ready = true;
         entry.twiml = `<Response>
   <Play>${host}/audio/${repeatId}.mp3</Play>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
 </Response>`;
       }
     })();
@@ -1287,7 +1314,7 @@ If no year is specified, assume the next upcoming future date.
     return res.type("text/xml").send(
 `<Response>
   <Say>Sorry—could you say that again?</Say>
-  <Gather input="speech" action="${getHost(req)}/voice/turn" method="POST" speechTimeout="auto" />
+  <Gather input="speech" action="${getHost(req)}/voice/turn" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
 </Response>`
     );
   }
@@ -1311,7 +1338,7 @@ app.get("/voice/turn/result", async (req, res) => {
       return res.type("text/xml").send(
 `<Response>
   <Play>${host}/audio/${repeatId}.mp3</Play>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
 </Response>`
       );
     }
@@ -1329,7 +1356,7 @@ app.get("/voice/turn/result", async (req, res) => {
     return res.type("text/xml").send(
 `<Response>
   <Say>Sorry—could you say that again?</Say>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" />
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
 </Response>`
     );
   }
