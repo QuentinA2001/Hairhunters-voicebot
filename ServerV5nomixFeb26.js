@@ -525,6 +525,7 @@ function torontoNowString() {
 }
 
 function isCompleteBooking(action) {
+  const normalized = normalizePhone(action?.phone || "");
   return Boolean(
     action &&
     action.action === "book" &&
@@ -532,7 +533,7 @@ function isCompleteBooking(action) {
     action.stylist &&
     action.datetime &&
     action.name &&
-    action.phone
+    normalized.length === 10
   );
 }
 
@@ -723,7 +724,16 @@ const bookingDraftStore = new Map();      // callSid -> { name, phone, service, 
 const awaitingPhoneConfirm = new Map();   // callSid -> "9055558851" waiting for yes/no
 
 function speakDigits(digits) {
-  return String(digits).split("").join(" ");
+  const d = normalizePhone(digits);
+  if (d.length !== 10) return "";
+  const words = {
+    "0": "zero", "1": "one", "2": "two", "3": "three", "4": "four",
+    "5": "five", "6": "six", "7": "seven", "8": "eight", "9": "nine",
+  };
+  const area = d.slice(0, 3).split("").map((n) => words[n]).join(" ");
+  const mid = d.slice(3, 6).split("").map((n) => words[n]).join(" ");
+  const tail = d.slice(6).split("").map((n) => words[n]).join(" ");
+  return `${area}, ${mid}, ${tail}`;
 }
 
 /**
@@ -735,26 +745,48 @@ function speakDigits(digits) {
  */
 function extractLikelyPhoneFromSpeech(speech) {
   const raw = String(speech || "").toLowerCase();
+  const directDigits = raw.replace(/\D/g, "");
+  if (directDigits.length === 10) return directDigits;
+  if (directDigits.length > 10) return directDigits.slice(-10);
 
-  // normalize common "oh"/"o" to zero
-  let t = raw
-    .replace(/\boh\b/g, " zero ")
-    .replace(/\bo\b/g, " zero ")
+  const tokenMap = {
+    zero: "0", oh: "0", o: "0",
+    one: "1", won: "1",
+    two: "2", to: "2", too: "2",
+    three: "3", tree: "3",
+    four: "4", for: "4",
+    five: "5",
+    six: "6",
+    seven: "7",
+    eight: "8", ate: "8",
+    nine: "9",
+  };
+  const phoneContext = /\b(phone|number|digits?|call me|reach me)\b/.test(raw);
+  const tokens = raw
     .replace(/-/g, " ")
     .replace(/\./g, " ")
-    .replace(/,/g, " ");
+    .replace(/,/g, " ")
+    .replace(/[^\w\s]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
 
-  // word -> digit mapping
-  const map = {
-    zero: "0", one: "1", two: "2", three: "3", four: "4",
-    five: "5", six: "6", seven: "7", eight: "8", nine: "9",
-  };
+  let built = "";
+  let mappedCount = 0;
+  for (const tok of tokens) {
+    if (/^\d+$/.test(tok)) {
+      built += tok;
+      mappedCount += tok.length;
+      continue;
+    }
+    const mapped = tokenMap[tok];
+    if (mapped) {
+      built += mapped;
+      mappedCount += 1;
+    }
+  }
 
-  // turn words into digits
-  t = t.split(/\s+/).map(w => (map[w] ?? w)).join(" ");
-
-  // keep only digits
-  const digits = t.replace(/\D/g, "");
+  if (!phoneContext && mappedCount < 7) return "";
+  const digits = built.replace(/\D/g, "");
 
   // prefer a clean 10-digit number if present anywhere
   if (digits.length === 10) return digits;
@@ -1197,7 +1229,21 @@ If no year is specified, assume the next upcoming future date.
 
         // A) If we are waiting on "yes/no" to confirm phone
         if (awaitingPhoneConfirm.has(callSid)) {
-          const pendingPhone = awaitingPhoneConfirm.get(callSid);
+          const pendingPhone = normalizePhone(awaitingPhoneConfirm.get(callSid));
+          if (pendingPhone.length !== 10) {
+            awaitingPhoneConfirm.delete(callSid);
+            const line = "Sorry, I missed that number. Please say the full 10-digit phone number again, one digit at a time.";
+            const audio = await ttsWithRetry(line);
+            const id = uuidv4();
+            audioStore.set(id, audio);
+
+            entry.ready = true;
+            entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
+</Response>`;
+            return;
+          }
 
           if (isYes(userSpeech)) {
             setDraft(callSid, { phone: pendingPhone });
@@ -1240,7 +1286,10 @@ If no year is specified, assume the next upcoming future date.
           }
 
           // unclear response: ask again
-          const line = `Just to confirm — is your number ${speakDigits(pendingPhone)}?`;
+          const spokenPhone = speakDigits(pendingPhone);
+          const line = spokenPhone
+            ? `Just to confirm — is your number ${spokenPhone}?`
+            : "Sorry, I missed that number. Please say the full 10-digit phone number again, one digit at a time.";
           const audio = await ttsWithRetry(line);
           const id = uuidv4();
           audioStore.set(id, audio);
@@ -1254,10 +1303,14 @@ If no year is specified, assume the next upcoming future date.
         }
 
         // B) If caller just said a full phone number this turn -> ask for confirmation
-        if (maybePhone.length === 10 && !getDraft(callSid).phone) {
-          awaitingPhoneConfirm.set(callSid, maybePhone);
+        if (normalizePhone(maybePhone).length === 10 && !getDraft(callSid).phone) {
+          const cleanPhone = normalizePhone(maybePhone);
+          awaitingPhoneConfirm.set(callSid, cleanPhone);
 
-          const line = `Just to confirm — is your number ${speakDigits(maybePhone)}?`;
+          const spokenPhone = speakDigits(cleanPhone);
+          const line = spokenPhone
+            ? `Just to confirm — is your number ${spokenPhone}?`
+            : "Sorry, I missed that number. Please say the full 10-digit phone number again, one digit at a time.";
           const audio = await ttsWithRetry(line);
           const id = uuidv4();
           audioStore.set(id, audio);
@@ -1319,7 +1372,9 @@ If no year is specified, assume the next upcoming future date.
           if (action.service) patchFromAction.service = action.service;
           if (action.stylist) patchFromAction.stylist = action.stylist;
           if (action.name) patchFromAction.name = action.name;
-          if (action.phone) patchFromAction.phone = normalizePhone(action.phone) || action.phone;
+          if (action.phone && normalizePhone(action.phone).length === 10) {
+            patchFromAction.phone = normalizePhone(action.phone);
+          }
           const shouldAcceptActionDatetime = Boolean(
             action.datetime &&
             (!draftBeforeActionMerge.datetime || finalResolvedISO)
@@ -1415,7 +1470,7 @@ If no year is specified, assume the next upcoming future date.
             return;
           }
 
-          action.phone = normalizePhone(action.phone) || action.phone;
+          action.phone = normalizePhone(action.phone);
           action._createdAt = Date.now();
           setDraft(callSid, {
             service: action.service,
