@@ -1025,13 +1025,11 @@ If no year is specified, assume the next upcoming future date.
         const pendingBooking = pendingBookings.get(callSid);
 
         if (pendingBooking && isYes(userSpeech)) {
-          const pretty = formatTorontoConfirm(pendingBooking.datetime) || pendingBooking.datetime;
-
           try {
             console.log("✅ Confirmed booking, posting to Zapier:", pendingBooking);
             await postBookingToZapier(pendingBooking);
 
-            const finalLine = `Perfect ${pendingBooking.name}. You’re all set for ${pretty}.`;
+            const finalLine = `Perfect ${pendingBooking.name}. You are all set. Thanks for calling.`;
             const audio = await ttsWithRetry(finalLine);
             const id = uuidv4();
             audioStore.set(id, audio);
@@ -1191,8 +1189,8 @@ If no year is specified, assume the next upcoming future date.
 
             const nextQuestion = getNextMissingQuestion(getDraft(callSid));
             const line = nextQuestion
-              ? `Perfect — I’ve got ${speakDigits(pendingPhone)}. ${nextQuestion}`
-              : `Perfect — I’ve got ${speakDigits(pendingPhone)}.`;
+              ? `Perfect. ${nextQuestion}`
+              : `Perfect.`;
             const audio = await ttsWithRetry(line);
             const id = uuidv4();
             audioStore.set(id, audio);
