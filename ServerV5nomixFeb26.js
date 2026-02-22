@@ -265,8 +265,8 @@ function extractNameFromSpeech(text, opts = {}) {
   if (isYes(t) || isNo(t)) return null;
 
   const explicit =
-    raw.match(/\b(?:my name is|name is|this is|i am|i'm|it is|it's)\s+([a-z][a-z' -]{0,40}?)(?=\s+(?:and|my|phone|number|for|to|with|at)\b|$)/i) ||
-    raw.match(/\b(?:its|it s)\s+([a-z][a-z' -]{0,40}?)(?=\s+(?:and|my|phone|number|for|to|with|at)\b|$)/i);
+    raw.match(/\b(?:my name is|name is|this is|i am|i'm|it is|it's)\s+([a-z][a-z' -]{0,40}?)(?=\s+(?:and|my|phone|number|for|to|with|at|i|im|i'm|want|would|need|like|calling)\b|$)/i) ||
+    raw.match(/\b(?:its|it s)\s+([a-z][a-z' -]{0,40}?)(?=\s+(?:and|my|phone|number|for|to|with|at|i|im|i'm|want|would|need|like|calling)\b|$)/i);
   if (explicit?.[1]) {
     const clipped = explicit[1].replace(/[^a-z' -]/gi, " ").replace(/\s+/g, " ").trim().split(" ").slice(0, 3).join(" ");
     const candidate = titleCaseName(clipped);
@@ -607,37 +607,58 @@ function parseNanpPhone(input) {
   return null;
 }
 
+function getNanpPhoneQuality(input) {
+  const raw = String(input || "").trim();
+  if (!raw) return { phone: null, valid: false, possible: false, national: "" };
+
+  const tries = [raw, raw.replace(/[^\d+]/g, ""), raw.replace(/\D/g, "")];
+  for (const candidate of tries) {
+    if (!candidate) continue;
+    for (const region of ["CA", "US"]) {
+      try {
+        const phone = parsePhoneNumberFromString(candidate, region);
+        if (!phone) continue;
+        if (phone.country && !["CA", "US"].includes(phone.country)) continue;
+        const possible = Boolean(phone?.isPossible?.());
+        const valid = Boolean(phone?.isValid?.());
+        const national = String(phone.nationalNumber || "");
+        if (!possible && !valid) continue;
+        if (!/^\d{10}$/.test(national)) continue;
+        return { phone, valid, possible: possible || valid, national };
+      } catch {
+        // ignore noisy speech parse errors
+      }
+    }
+  }
+  return { phone: null, valid: false, possible: false, national: "" };
+}
+
 function toValidNanpPhone10(input) {
-  const phone = parseNanpPhone(input);
-  if (!phone) return "";
-  const national = String(phone.nationalNumber || "");
-  return /^\d{10}$/.test(national) ? national : "";
+  const q = getNanpPhoneQuality(input);
+  return q.national || "";
 }
 
 function selectBestPhoneDigits(s) {
   const digits = String(s || "").replace(/\D/g, "");
   if (!digits) return "";
-  if (digits.length === 10 || digits.length === 11) {
-    const exact = toValidNanpPhone10(digits);
-    if (exact) return exact;
-  }
+  const exactQ = getNanpPhoneQuality(digits);
+  if (digits.length === 10 && exactQ.national) return exactQ.national;
+  if (digits.length === 11 && exactQ.national) return exactQ.national;
   if (digits.length > 10) {
+    let firstPossible = "";
     for (let i = 0; i <= digits.length - 11; i += 1) {
       const cand11 = digits.slice(i, i + 11);
-      const valid11 = toValidNanpPhone10(cand11);
-      if (valid11) return valid11;
+      const q11 = getNanpPhoneQuality(cand11);
+      if (q11.valid && q11.national) return q11.national;
+      if (!firstPossible && q11.national) firstPossible = q11.national;
     }
     for (let i = 0; i <= digits.length - 10; i += 1) {
       const cand = digits.slice(i, i + 10);
-      const valid10 = toValidNanpPhone10(cand);
-      if (valid10) return valid10;
+      const q10 = getNanpPhoneQuality(cand);
+      if (q10.valid && q10.national) return q10.national;
+      if (!firstPossible && q10.national) firstPossible = q10.national;
     }
-    const first11 = digits.slice(0, 11);
-    const validFirst11 = toValidNanpPhone10(first11);
-    if (validFirst11) return validFirst11;
-    const first10 = digits.slice(0, 10);
-    const validFirst10 = toValidNanpPhone10(first10);
-    if (validFirst10) return validFirst10;
+    if (firstPossible) return firstPossible;
     return digits.slice(-10);
   }
   if (digits.length === 11 && digits.startsWith("1")) return digits.slice(1);
@@ -646,7 +667,8 @@ function selectBestPhoneDigits(s) {
 }
 
 function isLikelyNorthAmericanPhone(s) {
-  return Boolean(toValidNanpPhone10(s));
+  const q = getNanpPhoneQuality(s);
+  return Boolean(q.national);
 }
 
 function cleanSpeech(text) {
