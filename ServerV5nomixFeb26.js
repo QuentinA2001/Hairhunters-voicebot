@@ -580,7 +580,7 @@ function formatTorontoDateOnly(dateISO) {
 function isYes(text) {
   const t = cleanSpeech(text);
   if (/\b(no|nope|nah|negative|not|dont|do not)\b/.test(t)) return false;
-  return /\b(yes|yeah|yep|yup|correct|confirm|confirmed|sure|okay|ok|sounds good|that works)\b/.test(t);
+  return /\b(yes|yeah|yep|yup|correct|right|exactly|confirm|confirmed|sure|okay|ok|sounds good|that works|go ahead|book it|do it|thats correct|that is correct|thats right|that is right)\b/.test(t);
 }
 
 function isNo(text) {
@@ -1164,12 +1164,17 @@ If no year is specified, assume the next upcoming future date.
             return;
           }
 
-          messages.push({
-            role: "system",
-            content:
-              `The caller is correcting the appointment time. Keep service="${pendingBooking.service}", stylist="${pendingBooking.stylist}", name="${pendingBooking.name}", phone="${pendingBooking.phone}". ` +
-              `Update ONLY datetime based on the caller's correction and output ACTION_JSON book with updated datetime.`,
-          });
+          const line = "Sorry, I just need a quick yes or no. Should I finalize this booking?";
+          const audio = await ttsWithRetry(line);
+          const id = uuidv4();
+          audioStore.set(id, audio);
+
+          entry.ready = true;
+          entry.twiml = `<Response>
+  <Play>${host}/audio/${id}.mp3</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" timeout="60" actionOnEmptyResult="true" />
+</Response>`;
+          return;
         }
 
         // ---- PHONE CONFIRM FLOW (server-controlled) ----
