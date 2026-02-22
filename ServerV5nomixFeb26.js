@@ -46,7 +46,7 @@ const http = axios.create({ httpsAgent, timeout: 12000 });
 const pick = (v) => (v ? String(v).slice(0, 6) + "…" : "missing");
 
 // ---------- FILLERS (pre-generated ElevenLabs clips) ----------
-const fillerText = ["Just a moment.", "Got it.", "Okay.", "All right."];
+const fillerText = ["Okay.", "Alright.", "Sounds good."];
 const fillerIds = []; // mp3 ids ready to use
 
 const clipIds = {
